@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/cloudquery/plugin-sdk/internal/glob"
 	"github.com/cloudquery/plugin-sdk/schema"
 	"github.com/getsentry/sentry-go"
 	"github.com/rs/zerolog"
@@ -66,6 +67,12 @@ func (p *Plugin) resolveResource(ctx context.Context, table *schema.Table, clien
 	}
 
 	for _, c := range table.Columns {
+		for _, skipColumnPattern := range p.spec.SkipColumns {
+			if glob.Glob(skipColumnPattern, table.Name+"."+c.Name) {
+				logger.Debug().Str("skip_column", skipColumnPattern).Str("column", c.Name).Msg("skipping column based on skip_columns in config")
+				continue
+			}
+		}
 		p.resolveColumn(ctx, logger, tableMetrics, client, resource, c)
 	}
 

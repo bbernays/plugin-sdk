@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/apache/arrow/go/v13/arrow"
+	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/cloudquery/plugin-sdk/v4/message"
 	"github.com/cloudquery/plugin-sdk/v4/schema"
 	"github.com/rs/zerolog"
@@ -55,6 +55,12 @@ func (c *testPluginClient) Write(_ context.Context, res <-chan message.WriteMess
 }
 func (*testPluginClient) Close(context.Context) error {
 	return nil
+}
+func (*testPluginClient) Transform(context.Context, <-chan arrow.Record, chan<- arrow.Record) error {
+	return nil
+}
+func (*testPluginClient) TransformSchema(context.Context, *arrow.Schema) (*arrow.Schema, error) {
+	return nil, nil
 }
 
 func TestPluginSuccess(t *testing.T) {

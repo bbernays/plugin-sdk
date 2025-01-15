@@ -1,10 +1,11 @@
 package scalar
 
 import (
+	"encoding/json"
 	"reflect"
 	"strings"
 
-	"github.com/apache/arrow/go/v13/arrow"
+	"github.com/apache/arrow-go/v18/arrow"
 )
 
 type List struct {
@@ -81,19 +82,68 @@ func (s *List) Set(val any) error {
 	}
 
 	reflectedValue := reflect.ValueOf(val)
+	for reflectedValue.Kind() == reflect.Pointer && !reflectedValue.IsNil() {
+		reflectedValue = reflectedValue.Elem()
+	}
+
 	if !reflectedValue.IsValid() || reflectedValue.IsZero() {
 		return nil
 	}
 
+	switch value := val.(type) {
+	case string:
+		var x []any
+		if err := json.Unmarshal([]byte(value), &x); err != nil {
+			return err
+		}
+		length := len(x)
+		s.Value = make(Vector, length)
+		for i := 0; i < length; i++ {
+			s.Value[i] = NewScalar(s.Type.(*arrow.ListType).Elem())
+			if x[i] == nil {
+				continue
+			}
+			if err := s.Value[i].Set(x[i]); err != nil {
+				return err
+			}
+		}
+
+	case []byte:
+		var x []any
+		if err := json.Unmarshal(value, &x); err != nil {
+			return err
+		}
+		length := len(x)
+		s.Value = make(Vector, length)
+		for i := 0; i < length; i++ {
+			s.Value[i] = NewScalar(s.Type.(*arrow.ListType).Elem())
+			if x[i] == nil {
+				continue
+			}
+			if err := s.Value[i].Set(x[i]); err != nil {
+				return err
+			}
+		}
+
+	case *string:
+		if value == nil {
+			s.Valid = false
+			return nil
+		}
+		return s.Set(*value)
+	}
+
 	switch reflectedValue.Kind() {
-	case reflect.Array:
-		fallthrough
-	case reflect.Slice:
+	case reflect.Array, reflect.Slice:
 		length := reflectedValue.Len()
 		s.Value = make(Vector, length)
 		for i := 0; i < length; i++ {
 			s.Value[i] = NewScalar(s.Type.(*arrow.ListType).Elem())
-			if err := s.Value[i].Set(reflectedValue.Index(i).Interface()); err != nil {
+			iVal := reflectedValue.Index(i)
+			if isReflectValueNil(iVal) {
+				continue
+			}
+			if err := s.Value[i].Set(iVal.Interface()); err != nil {
 				return err
 			}
 		}
@@ -101,4 +151,17 @@ func (s *List) Set(val any) error {
 
 	s.Valid = true
 	return nil
+}
+
+func isReflectValueNil(v reflect.Value) bool {
+	switch v.Kind() {
+	case reflect.Pointer,
+		reflect.UnsafePointer,
+		reflect.Map,
+		reflect.Slice,
+		reflect.Interface:
+		return v.IsNil()
+	default:
+		return false
+	}
 }

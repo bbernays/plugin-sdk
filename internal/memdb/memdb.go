@@ -5,11 +5,12 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/apache/arrow/go/v13/arrow"
-	"github.com/apache/arrow/go/v13/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/cloudquery/plugin-sdk/v4/message"
 	"github.com/cloudquery/plugin-sdk/v4/plugin"
 	"github.com/cloudquery/plugin-sdk/v4/schema"
+	"github.com/cloudquery/plugin-sdk/v4/types"
 	"github.com/rs/zerolog"
 )
 
@@ -43,7 +44,56 @@ func GetNewClient(options ...Option) plugin.NewClientFunc {
 	c := &client{
 		memoryDB:     make(map[string][]arrow.Record),
 		memoryDBLock: sync.RWMutex{},
-		tables:       make(map[string]*schema.Table),
+		tables: map[string]*schema.Table{
+			"table1": {
+				Name: "table1",
+				Columns: []schema.Column{
+					{
+						Name:           "col1",
+						Type:           arrow.PrimitiveTypes.Int64,
+						Description:    "col1 description",
+						PrimaryKey:     true,
+						NotNull:        true,
+						IncrementalKey: false,
+						Unique:         true,
+					},
+				},
+				PermissionsNeeded: []string{"permission1"},
+				Relations: schema.Tables{
+					{
+						Name: "table2",
+						Columns: []schema.Column{
+							{
+								Name:           "col1",
+								Type:           types.UUID,
+								Description:    "col1 description",
+								PrimaryKey:     false,
+								NotNull:        false,
+								IncrementalKey: true,
+								Unique:         false,
+							},
+						},
+						Relations: schema.Tables{
+							{
+								Name: "table3",
+								Columns: []schema.Column{
+									{
+										Name:           "col1",
+										Type:           types.UUID,
+										Description:    "col1 description",
+										PrimaryKey:     false,
+										NotNull:        false,
+										IncrementalKey: true,
+										Unique:         false,
+									},
+								},
+								IsPaid: true,
+							},
+						},
+					},
+				},
+			},
+		},
 	}
 	for _, opt := range options {
 		opt(c)
@@ -61,7 +111,13 @@ func NewMemDBClientErrOnNew(context.Context, zerolog.Logger, []byte, plugin.NewC
 	return nil, fmt.Errorf("newTestDestinationMemDBClientErrOnNew")
 }
 
-func (c *client) overwrite(table *schema.Table, data arrow.Record) {
+func (c *client) overwrite(table *schema.Table, record arrow.Record) {
+	for i := int64(0); i < record.NumRows(); i++ {
+		c.overwriteRow(table, record.NewSlice(i, i+1))
+	}
+}
+
+func (c *client) overwriteRow(table *schema.Table, data arrow.Record) {
 	tableName := table.Name
 	pksIndex := table.PrimaryKeysIndexes()
 	if len(pksIndex) == 0 {
@@ -127,12 +183,12 @@ func (c *client) Sync(_ context.Context, options plugin.SyncOptions, res chan<- 
 	return nil
 }
 
-func (c *client) Tables(context.Context, plugin.TableOptions) (schema.Tables, error) {
+func (c *client) Tables(_ context.Context, opts plugin.TableOptions) (schema.Tables, error) {
 	tables := make(schema.Tables, 0, len(c.tables))
 	for _, table := range c.tables {
 		tables = append(tables, table)
 	}
-	return tables, nil
+	return tables.FilterDfs(opts.Tables, opts.SkipTables, opts.SkipDependentTables)
 }
 
 func (c *client) migrate(_ context.Context, table *schema.Table) {
@@ -173,6 +229,8 @@ func (c *client) Write(ctx context.Context, msgs <-chan message.WriteMessage) er
 			c.migrate(ctx, msg.Table)
 		case *message.WriteDeleteStale:
 			c.deleteStale(ctx, msg)
+		case *message.WriteDeleteRecord:
+			c.deleteRecord(ctx, msg)
 		case *message.WriteInsert:
 			sc := msg.Record.Schema()
 			tableName, ok := sc.Metadata().GetValue(schema.MetadataTableName)
@@ -210,11 +268,70 @@ func (c *client) deleteStale(_ context.Context, msg *message.WriteDeleteStale) {
 		syncColIndex := indices[0]
 
 		if row.Column(sourceColIndex).(*array.String).Value(0) == msg.SourceName {
-			rowSyncTime := row.Column(syncColIndex).(*array.Timestamp).Value(0).ToTime(arrow.Microsecond).UTC()
+			unit := row.Column(syncColIndex).DataType().(*arrow.TimestampType).Unit
+			rowSyncTime := row.Column(syncColIndex).(*array.Timestamp).Value(0).ToTime(unit).UTC()
 			if !rowSyncTime.Before(msg.SyncTime) {
 				filteredTable = append(filteredTable, c.memoryDB[tableName][i])
 			}
 		}
 	}
 	c.memoryDB[tableName] = filteredTable
+}
+
+func (c *client) deleteRecord(_ context.Context, msg *message.WriteDeleteRecord) {
+	var filteredTable []arrow.Record
+	tableName := msg.TableName
+	for i, row := range c.memoryDB[tableName] {
+		isMatch := true
+		// Groups are evaluated as AND
+		for _, predGroup := range msg.WhereClause {
+			for _, pred := range predGroup.Predicates {
+				predResult := evaluatePredicate(pred, row)
+				if predGroup.GroupingType == "AND" {
+					isMatch = isMatch && predResult
+				} else if predResult {
+					isMatch = true
+					break
+				}
+			}
+			// If any single predicate group is false then we can break out of the loop
+			if !isMatch {
+				break
+			}
+		}
+
+		if !isMatch {
+			filteredTable = append(filteredTable, c.memoryDB[tableName][i])
+		}
+	}
+	c.memoryDB[tableName] = filteredTable
+}
+
+func (*client) Transform(_ context.Context, _ <-chan arrow.Record, _ chan<- arrow.Record) error {
+	return nil
+}
+
+func (*client) TransformSchema(_ context.Context, _ *arrow.Schema) (*arrow.Schema, error) {
+	return nil, nil
+}
+
+func evaluatePredicate(pred message.Predicate, record arrow.Record) bool {
+	sc := record.Schema()
+	indices := sc.FieldIndices(pred.Column)
+	if len(indices) == 0 {
+		return false
+	}
+	syncColIndex := indices[0]
+
+	if record.Column(syncColIndex).DataType() != pred.Record.Column(0).DataType() {
+		return false
+	}
+	// dataType := record.Column(syncColIndex).DataType()
+	switch pred.Operator {
+	case "eq":
+		return record.Column(syncColIndex).String() == pred.Record.Column(0).String()
+		// return record.Column(syncColIndex).(*array.String).Value(0) == pred.Record.Column(0).(*array.String).Value(0)
+	default:
+		return false
+	}
 }

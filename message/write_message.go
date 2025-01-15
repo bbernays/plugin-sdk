@@ -1,11 +1,11 @@
 package message
 
 import (
+	"slices"
 	"time"
 
-	"github.com/apache/arrow/go/v13/arrow"
+	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/cloudquery/plugin-sdk/v4/schema"
-	"golang.org/x/exp/slices"
 )
 
 type writeBaseMessage struct{}
@@ -128,3 +128,44 @@ func (m WriteDeleteStales) Exists(tableName string) bool {
 		return msg.TableName == tableName
 	})
 }
+
+type TableRelation struct {
+	TableName   string
+	ParentTable string
+}
+
+type TableRelations []TableRelation
+
+type Predicate struct {
+	Operator string
+	Column   string
+	Record   arrow.Record
+}
+
+type Predicates []Predicate
+
+type PredicateGroup struct {
+	// This will be AND or OR
+	GroupingType string
+	Predicates   Predicates
+}
+
+type PredicateGroups []PredicateGroup
+
+type DeleteRecord struct {
+	TableName      string
+	TableRelations TableRelations
+	WhereClause    PredicateGroups
+	SyncTime       time.Time
+}
+
+type WriteDeleteRecord struct {
+	writeBaseMessage
+	DeleteRecord
+}
+
+func (m WriteDeleteRecord) GetTable() *schema.Table {
+	return &schema.Table{Name: m.TableName}
+}
+
+type WriteDeleteRecords []*WriteDeleteRecord

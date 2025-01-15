@@ -25,7 +25,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/apache/arrow/go/v13/arrow/util"
+	"github.com/cloudquery/plugin-sdk/v4/internal/batch"
 	"github.com/cloudquery/plugin-sdk/v4/message"
 	"github.com/cloudquery/plugin-sdk/v4/schema"
 	"github.com/cloudquery/plugin-sdk/v4/writers"
@@ -40,6 +40,9 @@ type Client interface {
 	// DeleteStale should block and handle WriteDeleteStale messages until the channel is closed.
 	DeleteStale(context.Context, <-chan *message.WriteDeleteStale) error
 
+	// DeleteRecords should block and handle WriteDeleteRecord messages until the channel is closed.
+	DeleteRecords(context.Context, <-chan *message.WriteDeleteRecord) error
+
 	// WriteTable should block and handle writes to a single table until the channel is closed. Table metadata can be found in the first WriteInsert message.
 	// The channel is closed when all inserts in the batch have been sent. New batches, if any, will be sent on a new call to WriteTable.
 	WriteTable(context.Context, <-chan *message.WriteInsert) error
@@ -48,9 +51,11 @@ type Client interface {
 type StreamingBatchWriter struct {
 	client Client
 
-	insertWorkers    map[string]*streamingWorkerManager[*message.WriteInsert]
-	migrateWorker    *streamingWorkerManager[*message.WriteMigrateTable]
-	deleteWorker     *streamingWorkerManager[*message.WriteDeleteStale]
+	insertWorkers      map[string]*streamingWorkerManager[*message.WriteInsert]
+	migrateWorker      *streamingWorkerManager[*message.WriteMigrateTable]
+	deleteStaleWorker  *streamingWorkerManager[*message.WriteDeleteStale]
+	deleteRecordWorker *streamingWorkerManager[*message.WriteDeleteRecord]
+
 	workersLock      sync.RWMutex
 	workersWaitGroup sync.WaitGroup
 
@@ -128,9 +133,14 @@ func (w *StreamingBatchWriter) Flush(_ context.Context) error {
 		w.migrateWorker.flush <- done
 		<-done
 	}
-	if w.deleteWorker != nil {
+	if w.deleteStaleWorker != nil {
 		done := make(chan bool)
-		w.deleteWorker.flush <- done
+		w.deleteStaleWorker.flush <- done
+		<-done
+	}
+	if w.deleteRecordWorker != nil {
+		done := make(chan bool)
+		w.deleteRecordWorker.flush <- done
 		<-done
 	}
 	for _, worker := range w.insertWorkers {
@@ -151,18 +161,26 @@ func (w *StreamingBatchWriter) Close(context.Context) error {
 	if w.migrateWorker != nil {
 		close(w.migrateWorker.ch)
 	}
-	if w.deleteWorker != nil {
-		close(w.deleteWorker.ch)
+	if w.deleteStaleWorker != nil {
+		close(w.deleteStaleWorker.ch)
+	}
+	if w.deleteRecordWorker != nil {
+		close(w.deleteRecordWorker.ch)
 	}
 	w.workersWaitGroup.Wait()
 
-	w.insertWorkers = nil
+	w.insertWorkers = make(map[string]*streamingWorkerManager[*message.WriteInsert])
+	w.migrateWorker = nil
+	w.deleteStaleWorker = nil
+	w.deleteRecordWorker = nil
+	w.lastMsgType = writers.MsgTypeUnset
 
 	return nil
 }
 
 func (w *StreamingBatchWriter) Write(ctx context.Context, msgs <-chan message.WriteMessage) error {
 	errCh := make(chan error)
+	defer close(errCh)
 
 	go func() {
 		for err := range errCh {
@@ -172,7 +190,7 @@ func (w *StreamingBatchWriter) Write(ctx context.Context, msgs <-chan message.Wr
 
 	for msg := range msgs {
 		msgType := writers.MsgID(msg)
-		if w.lastMsgType != msgType {
+		if w.lastMsgType != writers.MsgTypeUnset && w.lastMsgType != msgType {
 			if err := w.Flush(ctx); err != nil {
 				return err
 			}
@@ -183,12 +201,7 @@ func (w *StreamingBatchWriter) Write(ctx context.Context, msgs <-chan message.Wr
 		}
 	}
 
-	if err := w.Flush(ctx); err != nil {
-		return err
-	}
-
-	close(errCh)
-	return nil
+	return w.Close(ctx)
 }
 
 func (w *StreamingBatchWriter) startWorker(ctx context.Context, errCh chan<- error, msg message.WriteMessage) error {
@@ -213,17 +226,16 @@ func (w *StreamingBatchWriter) startWorker(ctx context.Context, errCh chan<- err
 			return nil
 		}
 		ch := make(chan *message.WriteMigrateTable)
-		flush := make(chan chan bool)
 		w.migrateWorker = &streamingWorkerManager[*message.WriteMigrateTable]{
 			ch:        ch,
 			writeFunc: w.client.MigrateTable,
 
-			flush: flush,
+			flush: make(chan chan bool),
 			errCh: errCh,
 
-			batchSizeRows: w.batchSizeRows,
-			batchTimeout:  w.batchTimeout,
-			tickerFn:      w.tickerFn,
+			limit:        batch.CappedAt(0, w.batchSizeRows),
+			batchTimeout: w.batchTimeout,
+			tickerFn:     w.tickerFn,
 		}
 
 		w.workersWaitGroup.Add(1)
@@ -233,26 +245,26 @@ func (w *StreamingBatchWriter) startWorker(ctx context.Context, errCh chan<- err
 	case *message.WriteDeleteStale:
 		w.workersLock.Lock()
 		defer w.workersLock.Unlock()
-		if w.deleteWorker != nil {
-			w.deleteWorker.ch <- m
+		if w.deleteStaleWorker != nil {
+			w.deleteStaleWorker.ch <- m
 			return nil
 		}
 		ch := make(chan *message.WriteDeleteStale)
-		flush := make(chan chan bool)
-		w.deleteWorker = &streamingWorkerManager[*message.WriteDeleteStale]{
+		w.deleteStaleWorker = &streamingWorkerManager[*message.WriteDeleteStale]{
 			ch:        ch,
 			writeFunc: w.client.DeleteStale,
 
-			flush: flush,
+			flush: make(chan chan bool),
 			errCh: errCh,
 
-			batchSizeRows: w.batchSizeRows,
-			batchTimeout:  w.batchTimeout,
+			limit:        batch.CappedAt(0, w.batchSizeRows),
+			batchTimeout: w.batchTimeout,
+			tickerFn:     w.tickerFn,
 		}
 
 		w.workersWaitGroup.Add(1)
-		go w.deleteWorker.run(ctx, &w.workersWaitGroup, tableName)
-		w.deleteWorker.ch <- m
+		go w.deleteStaleWorker.run(ctx, &w.workersWaitGroup, tableName)
+		w.deleteStaleWorker.ch <- m
 		return nil
 	case *message.WriteInsert:
 		w.workersLock.RLock()
@@ -264,20 +276,26 @@ func (w *StreamingBatchWriter) startWorker(ctx context.Context, errCh chan<- err
 		}
 
 		ch := make(chan *message.WriteInsert)
-		flush := make(chan chan bool)
 		wr = &streamingWorkerManager[*message.WriteInsert]{
 			ch:        ch,
 			writeFunc: w.client.WriteTable,
 
-			flush: flush,
+			flush: make(chan chan bool),
 			errCh: errCh,
 
-			batchSizeRows:  w.batchSizeRows,
-			batchSizeBytes: w.batchSizeBytes,
-			batchTimeout:   w.batchTimeout,
-			tickerFn:       w.tickerFn,
+			limit:        batch.CappedAt(w.batchSizeBytes, w.batchSizeRows),
+			batchTimeout: w.batchTimeout,
+			tickerFn:     w.tickerFn,
 		}
 		w.workersLock.Lock()
+		wrOld, ok := w.insertWorkers[tableName]
+		if ok {
+			w.workersLock.Unlock()
+			// some other goroutine could have already added the worker
+			// just send the message to it & discard our allocated worker
+			wrOld.ch <- m
+			return nil
+		}
 		w.insertWorkers[tableName] = wr
 		w.workersLock.Unlock()
 
@@ -285,7 +303,31 @@ func (w *StreamingBatchWriter) startWorker(ctx context.Context, errCh chan<- err
 		go wr.run(ctx, &w.workersWaitGroup, tableName)
 		ch <- m
 		return nil
+	case *message.WriteDeleteRecord:
+		w.workersLock.Lock()
+		defer w.workersLock.Unlock()
+		if w.deleteRecordWorker != nil {
+			w.deleteRecordWorker.ch <- m
+			return nil
+		}
+		ch := make(chan *message.WriteDeleteRecord)
+		// TODO: flush all workers for nested tables as well (See https://github.com/cloudquery/plugin-sdk/issues/1296)
+		w.deleteRecordWorker = &streamingWorkerManager[*message.WriteDeleteRecord]{
+			ch:        ch,
+			writeFunc: w.client.DeleteRecords,
 
+			flush: make(chan chan bool),
+			errCh: errCh,
+
+			limit:        batch.CappedAt(w.batchSizeBytes, w.batchSizeRows),
+			batchTimeout: w.batchTimeout,
+			tickerFn:     w.tickerFn,
+		}
+
+		w.workersWaitGroup.Add(1)
+		go w.deleteRecordWorker.run(ctx, &w.workersWaitGroup, tableName)
+		w.deleteRecordWorker.ch <- m
+		return nil
 	default:
 		return fmt.Errorf("unhandled message type: %T", msg)
 	}
@@ -298,19 +340,17 @@ type streamingWorkerManager[T message.WriteMessage] struct {
 	flush chan chan bool
 	errCh chan<- error
 
-	batchSizeRows  int64
-	batchSizeBytes int64
-	batchTimeout   time.Duration
-	tickerFn       writers.TickerFunc
+	limit        *batch.Cap
+	batchTimeout time.Duration
+	tickerFn     writers.TickerFunc
 }
 
 func (s *streamingWorkerManager[T]) run(ctx context.Context, wg *sync.WaitGroup, tableName string) {
 	defer wg.Done()
 	var (
-		clientCh            chan T
-		clientErrCh         chan error
-		open                bool
-		sizeBytes, sizeRows int64
+		clientCh    chan T
+		clientErrCh chan error
+		open        bool
 	)
 
 	ensureOpened := func() {
@@ -337,14 +377,17 @@ func (s *streamingWorkerManager[T]) run(ctx context.Context, wg *sync.WaitGroup,
 			if err := <-clientErrCh; err != nil {
 				s.errCh <- fmt.Errorf("handler failed on %s: %w", tableName, err)
 			}
+			s.limit.Reset()
 		}
 		open = false
-		sizeBytes, sizeRows = 0, 0
 	}
 	defer closeFlush()
 
 	ticker := s.tickerFn(s.batchTimeout)
 	defer ticker.Stop()
+
+	tickerCh, ctxDone := ticker.Chan(), ctx.Done()
+
 	for {
 		select {
 		case r, ok := <-s.ch:
@@ -352,30 +395,55 @@ func (s *streamingWorkerManager[T]) run(ctx context.Context, wg *sync.WaitGroup,
 				return
 			}
 
-			var recSize int64
 			if ins, ok := any(r).(*message.WriteInsert); ok {
-				recSize = util.TotalRecordSize(ins.Record)
+				add, toFlush, rest := batch.SliceRecord(ins.Record, s.limit)
+				if add != nil {
+					ensureOpened()
+					s.limit.AddSlice(add)
+					clientCh <- any(&message.WriteInsert{Record: add.Record}).(T)
+				}
+				if len(toFlush) > 0 || rest != nil || s.limit.ReachedLimit() {
+					// flush current batch
+					closeFlush()
+					ticker.Reset(s.batchTimeout)
+				}
+				for _, sliceToFlush := range toFlush {
+					ensureOpened()
+					s.limit.AddRows(sliceToFlush.NumRows())
+					clientCh <- any(&message.WriteInsert{Record: sliceToFlush}).(T)
+					closeFlush()
+					ticker.Reset(s.batchTimeout)
+				}
+
+				// set the remainder
+				if rest != nil {
+					ensureOpened()
+					s.limit.AddSlice(rest)
+					clientCh <- any(&message.WriteInsert{Record: rest.Record}).(T)
+				}
+			} else {
+				ensureOpened()
+				clientCh <- r
+				s.limit.AddRows(1)
+				if s.limit.ReachedLimit() {
+					closeFlush()
+					ticker.Reset(s.batchTimeout)
+				}
 			}
 
-			if (s.batchSizeRows > 0 && sizeRows >= s.batchSizeRows) || (s.batchSizeBytes > 0 && sizeBytes+recSize >= s.batchSizeBytes) {
-				closeFlush()
-				ticker.Reset(s.batchTimeout)
-			}
-
-			ensureOpened()
-			clientCh <- r
-			sizeRows++
-			sizeBytes += recSize
-		case <-ticker.Chan():
-			if sizeRows > 0 {
+		case <-tickerCh:
+			if s.limit.Rows() > 0 {
 				closeFlush()
 			}
 		case done := <-s.flush:
-			if sizeRows > 0 {
+			if s.limit.Rows() > 0 {
 				closeFlush()
 				ticker.Reset(s.batchTimeout)
 			}
 			done <- true
+		case <-ctxDone:
+			// this means the request was cancelled
+			return // after this NO other call will succeed
 		}
 	}
 }

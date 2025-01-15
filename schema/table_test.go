@@ -3,7 +3,8 @@ package schema
 import (
 	"testing"
 
-	"github.com/apache/arrow/go/v13/arrow"
+	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/cloudquery/plugin-sdk/v4/types"
 	"github.com/google/go-cmp/cmp"
 	"github.com/stretchr/testify/require"
 )
@@ -15,6 +16,7 @@ var testTable = &Table{
 		{
 			Name:    "test2",
 			Columns: []Column{},
+			Parent:  &Table{Name: "test"},
 		},
 	},
 }
@@ -42,6 +44,15 @@ func TestTablesFlatten(t *testing.T) {
 	if len(tables) != 2 {
 		t.Fatal("expected 2 tables")
 	}
+}
+
+func TestTablesUnflatten(t *testing.T) {
+	srcTables := Tables{testTable}
+	tables, err := srcTables.FlattenTables().UnflattenTables()
+	require.NoError(t, err)
+	require.Equal(t, 1, len(srcTables)) // verify that the source Tables were left untouched
+	require.Equal(t, 1, len(tables))    // verify that the tables are equal to what we started with
+	require.Equal(t, 1, len(tables[0].Relations))
 }
 
 func TestTablesFilterDFS(t *testing.T) {
@@ -215,6 +226,175 @@ func TestTablesFilterDFS(t *testing.T) {
 			want:                    []string{"main_table", "sub_table_1"},
 		},
 		{
+			name: "when specifying a single child table, return only the parent and the specified child",
+			tables: []*Table{
+				{Name: "main_table", Relations: []*Table{
+					{Name: "sub_table_1", Parent: &Table{Name: "main_table"}},
+					{Name: "sub_table_2", Parent: &Table{Name: "main_table"}}}}},
+			configurationTables: []string{"sub_table_1"},
+			want:                []string{"main_table", "sub_table_1"},
+		},
+		{
+			name: "when specifying a leaf table, return only the parents and the leaf",
+			tables: []*Table{
+				{Name: "0", Relations: []*Table{
+					{Name: "0_1", Parent: &Table{Name: "0"}, Relations: []*Table{
+						{Name: "0_1_1", Parent: &Table{Name: "0_1"}, Relations: []*Table{
+							{Name: "0_1_1_1", Parent: &Table{Name: "0_1_1"}},
+							{Name: "0_1_1_2", Parent: &Table{Name: "0_1_1"}, Relations: []*Table{
+								{Name: "0_1_1_2_1", Parent: &Table{Name: "0_1_1_2"}},
+								{Name: "0_1_1_2_2", Parent: &Table{Name: "0_1_1_2"}},
+							}},
+							{Name: "0_1_1_3", Parent: &Table{Name: "0_1_1"}},
+						}},
+						{Name: "0_1_2", Parent: &Table{Name: "0_1"}, Relations: []*Table{
+							{Name: "0_1_2_1", Parent: &Table{Name: "0_1_2"}},
+							{Name: "0_1_2_2", Parent: &Table{Name: "0_1_2"}},
+							{Name: "0_1_2_3", Parent: &Table{Name: "0_1_2"}},
+						}},
+						{Name: "0_1_3", Parent: &Table{Name: "0_1"}},
+					}},
+					{Name: "0_2", Parent: &Table{Name: "0"}, Relations: []*Table{
+						{Name: "0_2_1", Parent: &Table{Name: "0_2"}},
+						{Name: "0_2_2", Parent: &Table{Name: "0_2"}},
+					}},
+					{Name: "0_3", Parent: &Table{Name: "0"}},
+				}},
+				{Name: "1", Relations: []*Table{
+					{Name: "1_1", Parent: &Table{Name: "1"}, Relations: []*Table{
+						{Name: "1_1_1", Parent: &Table{Name: "1_1"}, Relations: []*Table{
+							{Name: "1_1_1_1", Parent: &Table{Name: "1_1_1"}},
+							{Name: "1_1_1_2", Parent: &Table{Name: "1_1_1"}, Relations: []*Table{
+								{Name: "1_1_1_2_1", Parent: &Table{Name: "1_1_1_2"}},
+								{Name: "1_1_1_2_2", Parent: &Table{Name: "1_1_1_2"}},
+							}},
+							{Name: "1_1_1_3", Parent: &Table{Name: "1_1_1"}},
+						}},
+						{Name: "1_1_2", Parent: &Table{Name: "1_1"}, Relations: []*Table{
+							{Name: "1_1_2_1", Parent: &Table{Name: "1_1_2"}},
+							{Name: "1_1_2_2", Parent: &Table{Name: "1_1_2"}},
+							{Name: "1_1_2_3", Parent: &Table{Name: "1_1_2"}},
+						}},
+						{Name: "1_1_3", Parent: &Table{Name: "1_1"}},
+					}},
+					{Name: "1_2", Parent: &Table{Name: "1"}, Relations: []*Table{
+						{Name: "1_2_1", Parent: &Table{Name: "1_2"}},
+						{Name: "1_2_2", Parent: &Table{Name: "1_2"}},
+					}},
+					{Name: "1_3", Parent: &Table{Name: "1"}},
+				}},
+			},
+			configurationTables: []string{"0_1_1_2_2", "0_1_2_3", "1_1_2_3"},
+			want:                []string{"0", "0_1", "0_1_1", "0_1_1_2", "0_1_1_2_2", "0_1_2", "0_1_2_3", "1", "1_1", "1_1_2", "1_1_2_3"},
+		},
+		{
+			name: "when specifying a descendant table, return the parents, the specified descendant and all its descendant if skip_dependent_tables is false",
+			tables: []*Table{
+				{Name: "0", Relations: []*Table{
+					{Name: "0_1", Parent: &Table{Name: "0"}, Relations: []*Table{
+						{Name: "0_1_1", Parent: &Table{Name: "0_1"}, Relations: []*Table{
+							{Name: "0_1_1_1", Parent: &Table{Name: "0_1_1"}},
+							{Name: "0_1_1_2", Parent: &Table{Name: "0_1_1"}, Relations: []*Table{
+								{Name: "0_1_1_2_1", Parent: &Table{Name: "0_1_1_2"}},
+								{Name: "0_1_1_2_2", Parent: &Table{Name: "0_1_1_2"}},
+							}},
+							{Name: "0_1_1_3", Parent: &Table{Name: "0_1_1"}},
+						}},
+						{Name: "0_1_2", Parent: &Table{Name: "0_1"}, Relations: []*Table{
+							{Name: "0_1_2_1", Parent: &Table{Name: "0_1_2"}},
+							{Name: "0_1_2_2", Parent: &Table{Name: "0_1_2"}},
+							{Name: "0_1_2_3", Parent: &Table{Name: "0_1_2"}},
+						}},
+						{Name: "0_1_3", Parent: &Table{Name: "0_1"}},
+					}},
+					{Name: "0_2", Parent: &Table{Name: "0"}, Relations: []*Table{
+						{Name: "0_2_1", Parent: &Table{Name: "0_2"}},
+						{Name: "0_2_2", Parent: &Table{Name: "0_2"}},
+					}},
+					{Name: "0_3", Parent: &Table{Name: "0"}},
+				}},
+				{Name: "1", Relations: []*Table{
+					{Name: "1_1", Parent: &Table{Name: "1"}, Relations: []*Table{
+						{Name: "1_1_1", Parent: &Table{Name: "1_1"}, Relations: []*Table{
+							{Name: "1_1_1_1", Parent: &Table{Name: "1_1_1"}},
+							{Name: "1_1_1_2", Parent: &Table{Name: "1_1_1"}, Relations: []*Table{
+								{Name: "1_1_1_2_1", Parent: &Table{Name: "1_1_1_2"}},
+								{Name: "1_1_1_2_2", Parent: &Table{Name: "1_1_1_2"}},
+							}},
+							{Name: "1_1_1_3", Parent: &Table{Name: "1_1_1"}},
+						}},
+						{Name: "1_1_2", Parent: &Table{Name: "1_1"}, Relations: []*Table{
+							{Name: "1_1_2_1", Parent: &Table{Name: "1_1_2"}},
+							{Name: "1_1_2_2", Parent: &Table{Name: "1_1_2"}},
+							{Name: "1_1_2_3", Parent: &Table{Name: "1_1_2"}},
+						}},
+						{Name: "1_1_3", Parent: &Table{Name: "1_1"}},
+					}},
+					{Name: "1_2", Parent: &Table{Name: "1"}, Relations: []*Table{
+						{Name: "1_2_1", Parent: &Table{Name: "1_2"}},
+						{Name: "1_2_2", Parent: &Table{Name: "1_2"}},
+					}},
+					{Name: "1_3", Parent: &Table{Name: "1"}},
+				}},
+			},
+			configurationTables: []string{"1_1_1_2"},
+			want:                []string{"1", "1_1", "1_1_1", "1_1_1_2", "1_1_1_2_1", "1_1_1_2_2"},
+		},
+		{
+			name: "when specifying a descendant table, return the parents and only the specified descendant if skip_dependent_tables is true",
+			tables: []*Table{
+				{Name: "0", Relations: []*Table{
+					{Name: "0_1", Parent: &Table{Name: "0"}, Relations: []*Table{
+						{Name: "0_1_1", Parent: &Table{Name: "0_1"}, Relations: []*Table{
+							{Name: "0_1_1_1", Parent: &Table{Name: "0_1_1"}},
+							{Name: "0_1_1_2", Parent: &Table{Name: "0_1_1"}, Relations: []*Table{
+								{Name: "0_1_1_2_1", Parent: &Table{Name: "0_1_1_2"}},
+								{Name: "0_1_1_2_2", Parent: &Table{Name: "0_1_1_2"}},
+							}},
+							{Name: "0_1_1_3", Parent: &Table{Name: "0_1_1"}},
+						}},
+						{Name: "0_1_2", Parent: &Table{Name: "0_1"}, Relations: []*Table{
+							{Name: "0_1_2_1", Parent: &Table{Name: "0_1_2"}},
+							{Name: "0_1_2_2", Parent: &Table{Name: "0_1_2"}},
+							{Name: "0_1_2_3", Parent: &Table{Name: "0_1_2"}},
+						}},
+						{Name: "0_1_3", Parent: &Table{Name: "0_1"}},
+					}},
+					{Name: "0_2", Parent: &Table{Name: "0"}, Relations: []*Table{
+						{Name: "0_2_1", Parent: &Table{Name: "0_2"}},
+						{Name: "0_2_2", Parent: &Table{Name: "0_2"}},
+					}},
+					{Name: "0_3", Parent: &Table{Name: "0"}},
+				}},
+				{Name: "1", Relations: []*Table{
+					{Name: "1_1", Parent: &Table{Name: "1"}, Relations: []*Table{
+						{Name: "1_1_1", Parent: &Table{Name: "1_1"}, Relations: []*Table{
+							{Name: "1_1_1_1", Parent: &Table{Name: "1_1_1"}},
+							{Name: "1_1_1_2", Parent: &Table{Name: "1_1_1"}, Relations: []*Table{
+								{Name: "1_1_1_2_1", Parent: &Table{Name: "1_1_1_2"}},
+								{Name: "1_1_1_2_2", Parent: &Table{Name: "1_1_1_2"}},
+							}},
+							{Name: "1_1_1_3", Parent: &Table{Name: "1_1_1"}},
+						}},
+						{Name: "1_1_2", Parent: &Table{Name: "1_1"}, Relations: []*Table{
+							{Name: "1_1_2_1", Parent: &Table{Name: "1_1_2"}},
+							{Name: "1_1_2_2", Parent: &Table{Name: "1_1_2"}},
+							{Name: "1_1_2_3", Parent: &Table{Name: "1_1_2"}},
+						}},
+						{Name: "1_1_3", Parent: &Table{Name: "1_1"}},
+					}},
+					{Name: "1_2", Parent: &Table{Name: "1"}, Relations: []*Table{
+						{Name: "1_2_1", Parent: &Table{Name: "1_2"}},
+						{Name: "1_2_2", Parent: &Table{Name: "1_2"}},
+					}},
+					{Name: "1_3", Parent: &Table{Name: "1"}},
+				}},
+			},
+			configurationTables: []string{"1_1_1_2"},
+			skipDependentTables: true,
+			want:                []string{"1", "1_1", "1_1_1", "1_1_1_2"},
+		},
+		{
 			name: "skip child tables if skip_dependent_tables is true",
 			tables: []*Table{
 				{Name: "main_table", Relations: []*Table{
@@ -334,6 +514,181 @@ var testTableGetChangeTestCases = []testTableGetChangeTestCase{
 			},
 		},
 	},
+
+	{
+		name: "move to cq_id as primary key",
+		target: &Table{
+			Name: "test",
+			Columns: []Column{
+				{
+					Name:        "_cq_id",
+					Type:        types.ExtensionTypes.UUID,
+					Description: "Internal CQ ID of the row",
+					NotNull:     true,
+					Unique:      true,
+					PrimaryKey:  true,
+				},
+				{Name: "bool", Type: arrow.FixedWidthTypes.Boolean, PrimaryKey: false},
+			},
+		},
+		source: &Table{
+			Name: "test",
+			Columns: []Column{
+				{
+					Name:        "_cq_id",
+					Type:        types.ExtensionTypes.UUID,
+					Description: "Internal CQ ID of the row",
+					NotNull:     true,
+					Unique:      true,
+				},
+				{Name: "bool", Type: arrow.FixedWidthTypes.Boolean, PrimaryKey: true},
+			},
+		},
+		expectedChanges: []TableColumnChange{
+			{
+				Type: TableColumnChangeTypeMoveToCQOnly,
+			},
+			{
+				Type:       TableColumnChangeTypeUpdate,
+				ColumnName: "_cq_id",
+				Current: Column{
+					Name:        "_cq_id",
+					Type:        types.ExtensionTypes.UUID,
+					Description: "Internal CQ ID of the row",
+					NotNull:     true,
+					Unique:      true,
+					PrimaryKey:  true,
+				},
+				Previous: Column{
+					Name:        "_cq_id",
+					Type:        types.ExtensionTypes.UUID,
+					Description: "Internal CQ ID of the row",
+					NotNull:     true,
+					Unique:      true,
+				},
+			},
+			{
+				Type:       TableColumnChangeTypeUpdate,
+				ColumnName: "bool",
+				Current:    Column{Name: "bool", Type: arrow.FixedWidthTypes.Boolean, PrimaryKey: false},
+				Previous:   Column{Name: "bool", Type: arrow.FixedWidthTypes.Boolean, PrimaryKey: true},
+			},
+		},
+	},
+
+	{
+		name: "move to cq_id as primary key and drop unique constraint",
+		target: &Table{
+			Name: "test",
+			Columns: []Column{
+				{
+					Name:        "_cq_id",
+					Type:        types.ExtensionTypes.UUID,
+					Description: "Internal CQ ID of the row",
+					NotNull:     true,
+					// Unique:      true,
+					PrimaryKey: true,
+				},
+				{Name: "bool", Type: arrow.FixedWidthTypes.Boolean, PrimaryKey: false},
+			},
+		},
+		source: &Table{
+			Name: "test",
+			Columns: []Column{
+				{
+					Name:        "_cq_id",
+					Type:        types.ExtensionTypes.UUID,
+					Description: "Internal CQ ID of the row",
+					NotNull:     true,
+					Unique:      true,
+				},
+				{Name: "bool", Type: arrow.FixedWidthTypes.Boolean, PrimaryKey: true},
+			},
+		},
+		expectedChanges: []TableColumnChange{
+			{
+				Type: TableColumnChangeTypeMoveToCQOnly,
+			},
+			{
+				Type:       TableColumnChangeTypeUpdate,
+				ColumnName: "_cq_id",
+				Current: Column{
+					Name:        "_cq_id",
+					Type:        types.ExtensionTypes.UUID,
+					Description: "Internal CQ ID of the row",
+					NotNull:     true,
+					Unique:      false,
+					PrimaryKey:  true,
+				},
+				Previous: Column{
+					Name:        "_cq_id",
+					Type:        types.ExtensionTypes.UUID,
+					Description: "Internal CQ ID of the row",
+					NotNull:     true,
+					Unique:      true,
+				},
+			},
+			{
+				Type:       TableColumnChangeTypeRemoveUniqueConstraint,
+				ColumnName: "_cq_id",
+				Previous: Column{
+					Name:        "_cq_id",
+					Type:        types.ExtensionTypes.UUID,
+					Description: "Internal CQ ID of the row",
+					NotNull:     true,
+					Unique:      true,
+				},
+			},
+			{
+				Type:       TableColumnChangeTypeUpdate,
+				ColumnName: "bool",
+				Current:    Column{Name: "bool", Type: arrow.FixedWidthTypes.Boolean, PrimaryKey: false},
+				Previous:   Column{Name: "bool", Type: arrow.FixedWidthTypes.Boolean, PrimaryKey: true},
+			},
+		},
+	},
+
+	{
+		name: "drop unique constraint",
+		target: &Table{
+			Name: "test",
+			Columns: []Column{
+				{
+					Name:        "_cq_id",
+					Type:        types.ExtensionTypes.UUID,
+					Description: "Internal CQ ID of the row",
+					NotNull:     true,
+				},
+				{Name: "bool", Type: arrow.FixedWidthTypes.Boolean, PrimaryKey: true},
+			},
+		},
+		source: &Table{
+			Name: "test",
+			Columns: []Column{
+				{
+					Name:        "_cq_id",
+					Type:        types.ExtensionTypes.UUID,
+					Description: "Internal CQ ID of the row",
+					NotNull:     true,
+					Unique:      true,
+				},
+				{Name: "bool", Type: arrow.FixedWidthTypes.Boolean, PrimaryKey: true},
+			},
+		},
+		expectedChanges: []TableColumnChange{
+			{
+				Type:       TableColumnChangeTypeRemoveUniqueConstraint,
+				ColumnName: "_cq_id",
+				Previous: Column{
+					Name:        "_cq_id",
+					Type:        types.ExtensionTypes.UUID,
+					Description: "Internal CQ ID of the row",
+					NotNull:     true,
+					Unique:      true,
+				},
+			},
+		},
+	},
 }
 
 func TestTableGetChanges(t *testing.T) {
@@ -342,6 +697,80 @@ func TestTableGetChanges(t *testing.T) {
 			changes := tc.target.GetChanges(tc.source)
 			if diff := cmp.Diff(changes, tc.expectedChanges); diff != "" {
 				t.Errorf("diff (+got, -want): %v", diff)
+			}
+		})
+	}
+}
+
+func TestTablesToAndFromArrow(t *testing.T) {
+	// The attributes in this table should all be preserved when converting to and from Arrow.
+	tablesToTest := Tables{
+		// Test empty table
+		&Table{
+			Columns: []Column{},
+		},
+		// Test table with attributes
+		&Table{
+			Name:        "test_table",
+			Description: "Test table description",
+			Title:       "Test Table",
+			Parent: &Table{
+				Name: "parent_table",
+			},
+			IsIncremental: true,
+			Columns: []Column{
+				{Name: "bool", Type: arrow.FixedWidthTypes.Boolean},
+				{Name: "int", Type: arrow.PrimitiveTypes.Int64},
+				{Name: "float", Type: arrow.PrimitiveTypes.Float64},
+				{Name: "string", Type: arrow.BinaryTypes.String},
+				{Name: "json", Type: types.ExtensionTypes.JSON},
+				{Name: "unique", Type: arrow.BinaryTypes.String, Unique: true},
+				{Name: "primary_key", Type: arrow.BinaryTypes.String, PrimaryKey: true},
+				{Name: "not_null", Type: arrow.BinaryTypes.String, NotNull: true},
+				{Name: "incremental_key", Type: arrow.BinaryTypes.String, IncrementalKey: true},
+				{Name: "multiple_attributes", Type: arrow.BinaryTypes.String, PrimaryKey: true, IncrementalKey: true, NotNull: true, Unique: true},
+			},
+			PermissionsNeeded: []string{"storage.buckets.list", "compute.acceleratorTypes.list", "test,test"},
+		},
+	}
+
+	for _, table := range tablesToTest {
+		arrowSchema := table.ToArrowSchema()
+		tableFromArrow, err := NewTableFromArrowSchema(arrowSchema)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if diff := cmp.Diff(table, tableFromArrow); diff != "" {
+			t.Errorf("diff (+got, -want): %v", diff)
+		}
+	}
+}
+
+func TestValidateDuplicateTables(t *testing.T) {
+	tests := []struct {
+		name   string
+		tables Tables
+		err    string
+	}{
+		{
+			name:   "should return error when duplicate tables are found",
+			tables: Tables{{Name: "table1"}, {Name: "table1"}},
+			err:    "duplicate table table1",
+		},
+		{
+			name:   "should return error when duplicate relational tables are found",
+			tables: Tables{{Name: "table1", Relations: []*Table{{Name: "table2"}, {Name: "table2"}}}},
+			err:    "duplicate table table2",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.tables.ValidateDuplicateTables()
+			if tc.err != "" {
+				require.ErrorContains(t, err, tc.err)
+			} else {
+				require.NoError(t, err)
 			}
 		})
 	}

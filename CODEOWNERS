@@ -1,5 +1,6 @@
-*       @yevgenypats
+*       @cloudquery/cloudquery-framework
 CHANGELOG.md
+.release-please-manifest.json
 go.mod
 go.sum
 .github/

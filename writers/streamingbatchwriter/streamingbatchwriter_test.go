@@ -6,9 +6,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/apache/arrow/go/v13/arrow"
-	"github.com/apache/arrow/go/v13/arrow/array"
-	"github.com/apache/arrow/go/v13/arrow/memory"
+	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/cloudquery/plugin-sdk/v4/message"
 	"github.com/cloudquery/plugin-sdk/v4/schema"
 )
@@ -19,6 +19,7 @@ const (
 	messageTypeMigrateTable messageType = iota
 	messageTypeInsert
 	messageTypeDeleteStale
+	messageTypeDeleteRecord
 )
 
 type testStreamingBatchClient struct {
@@ -77,6 +78,14 @@ func (c *testStreamingBatchClient) DeleteStale(ctx context.Context, msgs <-chan 
 		key = c.handleTypeMessage(ctx, messageTypeDeleteStale, m, key)
 	}
 	return c.handleTypeCommit(ctx, messageTypeDeleteStale, key)
+}
+
+func (c *testStreamingBatchClient) DeleteRecords(ctx context.Context, msgs <-chan *message.WriteDeleteRecord) error {
+	key := ""
+	for m := range msgs {
+		key = c.handleTypeMessage(ctx, messageTypeDeleteRecord, m, key)
+	}
+	return c.handleTypeCommit(ctx, messageTypeDeleteRecord, key)
 }
 
 func (c *testStreamingBatchClient) handleTypeMessage(_ context.Context, t messageType, msg message.WriteMessage, key string) string {
@@ -188,7 +197,7 @@ func TestStreamingBatchSizeRows(t *testing.T) {
 	}()
 
 	table := schema.Table{Name: "table1", Columns: []schema.Column{{Name: "id", Type: arrow.PrimitiveTypes.Int64}}}
-	record := array.NewRecord(table.ToArrowSchema(), nil, 0)
+	record := getRecord(table.ToArrowSchema(), 1)
 	ch <- &message.WriteInsert{
 		Record: record,
 	}
@@ -227,7 +236,7 @@ func TestStreamingBatchTimeout(t *testing.T) {
 	ch := make(chan message.WriteMessage)
 
 	testClient := newClient()
-	tickerFn, expire := newMockTicker()
+	tickerFn, tickFn := newMockTicker()
 
 	wr, err := New(testClient, withTickerFn(tickerFn))
 	if err != nil {
@@ -240,7 +249,7 @@ func TestStreamingBatchTimeout(t *testing.T) {
 	}()
 
 	table := schema.Table{Name: "table1", Columns: []schema.Column{{Name: "id", Type: arrow.PrimitiveTypes.Int64}}}
-	record := array.NewRecord(table.ToArrowSchema(), nil, 0)
+	record := getRecord(table.ToArrowSchema(), 1)
 	ch <- &message.WriteInsert{
 		Record: record,
 	}
@@ -258,7 +267,7 @@ func TestStreamingBatchTimeout(t *testing.T) {
 	}
 
 	// flush
-	close(expire)
+	tickFn()
 	waitForLength(t, testClient.MessageLen, messageTypeInsert, 1)
 
 	close(ch)
@@ -288,7 +297,7 @@ func TestStreamingBatchNoTimeout(t *testing.T) {
 	}()
 
 	table := schema.Table{Name: "table1", Columns: []schema.Column{{Name: "id", Type: arrow.PrimitiveTypes.Int64}}}
-	record := array.NewRecord(table.ToArrowSchema(), nil, 0)
+	record := getRecord(table.ToArrowSchema(), 1)
 	ch <- &message.WriteInsert{
 		Record: record,
 	}
@@ -332,7 +341,7 @@ func TestStreamingBatchUpserts(t *testing.T) {
 	ch := make(chan message.WriteMessage)
 
 	testClient := newClient()
-	tickerFn, expire := newMockTicker()
+	tickerFn, tickFn := newMockTicker()
 	wr, err := New(testClient, WithBatchSizeRows(2), withTickerFn(tickerFn))
 	if err != nil {
 		t.Fatal(err)
@@ -363,7 +372,7 @@ func TestStreamingBatchUpserts(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 
 	// flush the batch
-	close(expire)
+	tickFn()
 	waitForLength(t, testClient.MessageLen, messageTypeInsert, 2)
 
 	close(ch)
@@ -390,4 +399,15 @@ func waitForLength(t *testing.T, checkLen func(messageType) int, msgType message
 			}
 		}
 	}
+}
+
+func getRecord(sc *arrow.Schema, rows int) arrow.Record {
+	builder := array.NewRecordBuilder(memory.DefaultAllocator, sc)
+	defer builder.Release()
+
+	for _, f := range builder.Fields() {
+		f.AppendEmptyValues(rows)
+	}
+
+	return builder.NewRecord()
 }

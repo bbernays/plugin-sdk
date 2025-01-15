@@ -78,10 +78,13 @@ func (c *Caser) ToSnake(s string) string {
 	var result string
 	var words []string
 	var lastPos int
+
+	s = strings.Join(strings.Fields(s), "_")
+
 	rs := []rune(s)
 
 	for i := 0; i < len(rs); i++ {
-		if i > 0 && unicode.IsUpper(rs[i]) {
+		if i > 0 && (unicode.IsUpper(rs[i]) || rs[i] == '_') {
 			// check if next word is initialism
 			if initialism := c.startsWithInitialism(s[lastPos:]); initialism != "" {
 				words = append(words, initialism)
@@ -100,6 +103,9 @@ func (c *Caser) ToSnake(s string) string {
 			}
 
 			words = append(words, s[lastPos:i])
+			if rs[i] == '_' {
+				i++
+			}
 			lastPos = i
 		}
 	}
@@ -107,7 +113,7 @@ func (c *Caser) ToSnake(s string) string {
 	// append the last word
 	if s[lastPos:] != "" {
 		// handle plurals of initialisms like CDNs, ARNs, IDs
-		if w := s[lastPos:]; w == "s" {
+		if w := s[lastPos:]; w == "s" && words != nil {
 			words[len(words)-1] = words[len(words)-1] + w
 		} else {
 			words = append(words, s[lastPos:])

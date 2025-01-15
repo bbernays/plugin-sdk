@@ -7,10 +7,10 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/apache/arrow/go/v13/arrow"
-	"github.com/apache/arrow/go/v13/arrow/array"
-	"github.com/apache/arrow/go/v13/arrow/ipc"
-	"github.com/apache/arrow/go/v13/arrow/memory"
+	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/ipc"
+	"github.com/apache/arrow-go/v18/arrow/memory"
 	pb "github.com/cloudquery/plugin-pb-go/pb/plugin/v3"
 	"github.com/cloudquery/plugin-sdk/v4/internal/memdb"
 	"github.com/cloudquery/plugin-sdk/v4/plugin"
@@ -40,6 +40,8 @@ func TestPluginServe(t *testing.T) {
 	}()
 
 	// https://stackoverflow.com/questions/42102496/testing-a-grpc-service
+	// TODO: Remove once there's a documented migration path per https://github.com/grpc/grpc-go/issues/7244
+	// nolint:staticcheck
 	conn, err := grpc.DialContext(ctx, "bufnet", grpc.WithContextDialer(srv.bufPluginDialer), grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithBlock())
 	if err != nil {
 		t.Fatalf("Failed to dial bufnet: %v", err)
@@ -67,7 +69,7 @@ func TestPluginServe(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	getTablesRes, err := c.GetTables(ctx, &pb.GetTables_Request{})
+	getTablesRes, err := c.GetTables(ctx, &pb.GetTables_Request{Tables: []string{"*"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -80,8 +82,8 @@ func TestPluginServe(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if len(tables) != 0 {
-		t.Fatalf("Expected 0 tables but got %d", len(tables))
+	if len(tables) != 3 {
+		t.Fatalf("Expected 2 tables but got %d", len(tables))
 	}
 	testTable := schema.Table{
 		Name: "test_table",

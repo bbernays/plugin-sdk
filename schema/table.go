@@ -2,12 +2,14 @@ package schema
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"regexp"
+	"slices"
 
-	"github.com/apache/arrow/go/v13/arrow"
+	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/cloudquery/plugin-sdk/v4/glob"
-	"golang.org/x/exp/slices"
+	"github.com/thoas/go-funk"
 )
 
 // TableResolver is the main entry point when a table is sync is called.
@@ -26,7 +28,7 @@ type Transform func(table *Table) error
 
 type Tables []*Table
 
-// This is deprecated
+// Deprecated: SyncSummary is deprecated.
 type SyncSummary struct {
 	Resources uint64
 	Errors    uint64
@@ -40,6 +42,11 @@ const (
 	TableColumnChangeTypeAdd
 	TableColumnChangeTypeUpdate
 	TableColumnChangeTypeRemove
+	// These are special cases to help users migrate
+	// As we remove unique constraints on _cq_id columns this will give destination plugins the ability to auto migrate
+	TableColumnChangeTypeRemoveUniqueConstraint
+	// Moving from composite pks to singular PK on _cq_id this will give destination plugins the ability to auto migrate
+	TableColumnChangeTypeMoveToCQOnly
 )
 
 type TableColumnChange struct {
@@ -51,50 +58,56 @@ type TableColumnChange struct {
 
 type Table struct {
 	// Name of table
-	Name string
+	Name string `json:"name"`
 	// Title to be used in documentation (optional: will be generated from name if not set)
-	Title string
+	Title string `json:"title"`
 	// table description
-	Description string
+	Description string `json:"description"`
+	// List of permissions needed to access this table, if any. For example ["Microsoft.Network/dnsZones/read"] or ["storage.buckets.list"]
+	PermissionsNeeded []string `json:"permissions_needed"`
 	// Columns are the set of fields that are part of this table
-	Columns ColumnList
+	Columns ColumnList `json:"columns"`
 	// Relations are a set of related tables defines
-	Relations Tables
+	Relations Tables `json:"relations"`
 	// Transform
-	Transform Transform
+	Transform Transform `json:"-"`
 	// Resolver is the main entry point to fetching table data and
-	Resolver TableResolver
+	Resolver TableResolver `json:"-"`
 	// Multiplex returns re-purposed meta clients. The sdk will execute the table with each of them
-	Multiplex Multiplexer
+	Multiplex Multiplexer `json:"-"`
 	// PostResourceResolver is called after all columns have been resolved, but before the Resource is sent to be inserted. The ordering of resolvers is:
 	//  (Table) Resolver → PreResourceResolver → ColumnResolvers → PostResourceResolver
-	PostResourceResolver RowResolver
+	PostResourceResolver RowResolver `json:"-"`
 	// PreResourceResolver is called before all columns are resolved but after Resource is created. The ordering of resolvers is:
 	//  (Table) Resolver → PreResourceResolver → ColumnResolvers → PostResourceResolver
-	PreResourceResolver RowResolver
+	PreResourceResolver RowResolver `json:"-"`
 	// IsIncremental is a flag that indicates if the table is incremental or not. This flag mainly affects how the table is
 	// documented.
-	IsIncremental bool
+	IsIncremental bool `json:"is_incremental"`
 
 	// IgnoreInTests is used to exclude a table from integration tests.
 	// By default, integration tests fetch all resources from cloudquery's test account, and verify all tables
 	// have at least one row.
 	// When IgnoreInTests is true, integration tests won't fetch from this table.
 	// Used when it is hard to create a reproducible environment with a row in this table.
-	IgnoreInTests bool
+	IgnoreInTests bool `json:"-"`
 
 	// Parent is the parent table in case this table is called via parent table (i.e. relation)
-	Parent *Table
+	Parent *Table `json:"-"`
 
-	PkConstraintName string
+	PkConstraintName string `json:"pk_constraint_name"`
+
+	// IsPaid indicates whether this table is a paid (premium) table.
+	// This relates to the CloudQuery plugin itself, and should not be confused
+	// with whether the table makes use of a paid API or not.
+	IsPaid bool `json:"is_paid"`
 }
 
 var (
-	reValidTableName  = regexp.MustCompile(`^[a-z_][a-z\d_]*$`)
 	reValidColumnName = regexp.MustCompile(`^[a-z_][a-z\d_]*$`)
 )
 
-// AddCqIds adds the cq_id and cq_parent_id columns to the table and all its relations
+// AddCqIDs adds the cq_id and cq_parent_id columns to the table and all its relations
 // set cq_id as primary key if no other primary keys
 func AddCqIDs(table *Table) {
 	havePks := len(table.PrimaryKeys()) > 0
@@ -114,6 +127,37 @@ func AddCqIDs(table *Table) {
 	}
 }
 
+// AddCqClientID adds the cq_client_id column to the table,
+// which is used to identify the multiplexed client that fetched the resource
+func AddCqClientID(t *Table) {
+	if t.Columns.Get(CqClientIDColumn.Name) == nil {
+		t.Columns = append(ColumnList{CqClientIDColumn}, t.Columns...)
+	}
+	for _, rel := range t.Relations {
+		AddCqClientID(rel)
+	}
+}
+
+// CqIDAsPK sets the cq_id column as primary key if it exists
+// and removes the primary key from all other columns
+func CqIDAsPK(t *Table) {
+	cqIDCol := t.Columns.Get(CqIDColumn.Name)
+	if cqIDCol == nil {
+		return
+	}
+	for i, c := range t.Columns {
+		if c.Name == CqIDColumn.Name {
+			// Ensure that the cq_id column is the primary key
+			t.Columns[i].PrimaryKey = true
+			continue
+		}
+		if !c.PrimaryKey {
+			continue
+		}
+		t.Columns[i].PrimaryKey = false
+	}
+}
+
 func NewTablesFromArrowSchemas(schemas []*arrow.Schema) (Tables, error) {
 	tables := make(Tables, len(schemas))
 	for i, schema := range schemas {
@@ -126,9 +170,9 @@ func NewTablesFromArrowSchemas(schemas []*arrow.Schema) (Tables, error) {
 	return tables, nil
 }
 
-// Create a CloudQuery Table abstraction from an arrow schema
-// arrow schema is a low level representation of a table that can be sent
-// over the wire in a cross-language way
+// NewTableFromArrowSchema creates a CloudQuery Table abstraction from an Arrow schema.
+// The Arrow schema is a low level representation of a table that can be sent
+// over the wire in a cross-language way.
 func NewTableFromArrowSchema(sc *arrow.Schema) (*Table, error) {
 	tableMD := sc.Metadata()
 	name, found := tableMD.GetValue(MetadataTableName)
@@ -137,19 +181,35 @@ func NewTableFromArrowSchema(sc *arrow.Schema) (*Table, error) {
 	}
 	description, _ := tableMD.GetValue(MetadataTableDescription)
 	constraintName, _ := tableMD.GetValue(MetadataConstraintName)
+	title, _ := tableMD.GetValue(MetadataTableTitle)
+	dependsOn, _ := tableMD.GetValue(MetadataTableDependsOn)
+	permissionsNeeded, _ := tableMD.GetValue(MetadataTablePermissionsNeeded)
+	var parent *Table
+	if dependsOn != "" {
+		parent = &Table{Name: dependsOn}
+	}
 	fields := sc.Fields()
 	columns := make(ColumnList, len(fields))
 	for i, field := range fields {
 		columns[i] = NewColumnFromArrowField(field)
 	}
+
+	var permissionsNeededArr []string
+	_ = json.Unmarshal([]byte(permissionsNeeded), &permissionsNeededArr)
 	table := &Table{
-		Name:             name,
-		Description:      description,
-		PkConstraintName: constraintName,
-		Columns:          columns,
+		Name:              name,
+		Description:       description,
+		PkConstraintName:  constraintName,
+		Columns:           columns,
+		Title:             title,
+		Parent:            parent,
+		PermissionsNeeded: permissionsNeededArr,
 	}
 	if isIncremental, found := tableMD.GetValue(MetadataIncremental); found {
 		table.IsIncremental = isIncremental == MetadataTrue
+	}
+	if isPaid, found := tableMD.GetValue(MetadataTableIsPaid); found {
+		table.IsPaid = isPaid == MetadataTrue
 	}
 	return table, nil
 }
@@ -162,6 +222,10 @@ func (t TableColumnChangeType) String() string {
 		return "update"
 	case TableColumnChangeTypeRemove:
 		return "remove"
+	case TableColumnChangeTypeRemoveUniqueConstraint:
+		return "remove_unique_constraint"
+	case TableColumnChangeTypeMoveToCQOnly:
+		return "move_to_cq_only"
 	default:
 		return "unknown"
 	}
@@ -175,6 +239,10 @@ func (t TableColumnChange) String() string {
 		return fmt.Sprintf("column: %s, type: %s, current: %s, previous: %s", t.ColumnName, t.Type, t.Current, t.Previous)
 	case TableColumnChangeTypeRemove:
 		return fmt.Sprintf("column: %s, type: %s, previous: %s", t.ColumnName, t.Type, t.Previous)
+	case TableColumnChangeTypeRemoveUniqueConstraint:
+		return fmt.Sprintf("column: %s, previous: %s", t.ColumnName, t.Previous)
+	case TableColumnChangeTypeMoveToCQOnly:
+		return fmt.Sprintf("multi-column: %s, type: %s", t.ColumnName, t.Type)
 	default:
 		return fmt.Sprintf("column: %s, type: %s, current: %s, previous: %s", t.ColumnName, t.Type, t.Current, t.Previous)
 	}
@@ -246,14 +314,20 @@ func (tt Tables) FilterDfs(tables, skipTables []string, skipDependentTables bool
 	return tt.FilterDfsFunc(include, exclude, skipDependentTables), nil
 }
 
-func (tt Tables) FlattenTables() Tables {
+func (tt Tables) flattenTablesRecursive() Tables {
 	tables := make(Tables, 0, len(tt))
 	for _, t := range tt {
 		table := *t
 		table.Relations = nil
 		tables = append(tables, &table)
-		tables = append(tables, t.Relations.FlattenTables()...)
+		tables = append(tables, t.Relations.flattenTablesRecursive()...)
 	}
+
+	return tables
+}
+
+func (tt Tables) FlattenTables() Tables {
+	tables := tt.flattenTablesRecursive()
 
 	seen := make(map[string]struct{})
 	deduped := make(Tables, 0, len(tables))
@@ -265,6 +339,31 @@ func (tt Tables) FlattenTables() Tables {
 	}
 
 	return slices.Clip(deduped)
+}
+
+// UnflattenTables returns a new Tables copy with the relations unflattened. This is the
+// opposite operation of FlattenTables.
+func (tt Tables) UnflattenTables() (Tables, error) {
+	tables := make(Tables, 0, len(tt))
+	for _, t := range tt {
+		table := *t
+		tables = append(tables, &table)
+	}
+	topLevel := make([]*Table, 0, len(tt))
+	// build relations
+	for _, table := range tables {
+		if table.Parent == nil {
+			topLevel = append(topLevel, table)
+			continue
+		}
+		parent := tables.Get(table.Parent.Name)
+		if parent == nil {
+			return nil, fmt.Errorf("parent table %s not found", table.Parent.Name)
+		}
+		table.Parent = parent
+		parent.Relations = append(parent.Relations, table)
+	}
+	return slices.Clip(topLevel), nil
 }
 
 func (tt Tables) TableNames() []string {
@@ -309,38 +408,30 @@ func (tt Tables) ValidateDuplicateColumns() error {
 }
 
 func (tt Tables) ValidateDuplicateTables() error {
+	tableNames := tt.TableNames()
 	tables := make(map[string]bool, len(tt))
-	for _, t := range tt {
-		if _, ok := tables[t.Name]; ok {
-			return fmt.Errorf("duplicate table %s", t.Name)
+	for _, t := range tableNames {
+		if _, ok := tables[t]; ok {
+			return fmt.Errorf("duplicate table %s", t)
 		}
-		tables[t.Name] = true
+		tables[t] = true
 	}
 	return nil
 }
 
-func (tt Tables) ValidateTableNames() error {
-	for _, t := range tt {
-		if err := t.ValidateName(); err != nil {
-			return err
-		}
-		if err := t.Relations.ValidateTableNames(); err != nil {
-			return err
+func (tt Tables) GetPaidTables() Tables {
+	flattenedTables := tt.FlattenTables()
+	paidTables := make(Tables, 0, len(flattenedTables))
+	for i := range flattenedTables {
+		if flattenedTables[i].IsPaid {
+			paidTables = append(paidTables, flattenedTables[i])
 		}
 	}
-	return nil
+	return paidTables
 }
 
-func (tt Tables) ValidateColumnNames() error {
-	for _, t := range tt {
-		if err := t.ValidateColumnNames(); err != nil {
-			return err
-		}
-		if err := t.Relations.ValidateColumnNames(); err != nil {
-			return err
-		}
-	}
-	return nil
+func (tt Tables) HasPaidTables() bool {
+	return len(tt.GetPaidTables()) > 0
 }
 
 // this will filter the tree in-place
@@ -353,24 +444,17 @@ func (t *Table) filterDfs(parentMatched bool, include, exclude func(*Table) bool
 		matched = true
 	}
 	filteredRelations := make([]*Table, 0, len(t.Relations))
+	childMatched := false
 	for _, r := range t.Relations {
 		filteredChild := r.filterDfs(matched, include, exclude, skipDependentTables)
 		if filteredChild != nil {
-			matched = true
+			childMatched = true
 			filteredRelations = append(filteredRelations, r)
 		}
 	}
 	t.Relations = filteredRelations
-	if matched {
+	if matched || childMatched {
 		return t
-	}
-	return nil
-}
-
-func (t *Table) ValidateName() error {
-	ok := reValidTableName.MatchString(t.Name)
-	if !ok {
-		return fmt.Errorf("table name %q is not valid: table names must contain only lower-case letters, numbers and underscores, and must start with a lower-case letter or underscore", t.Name)
 	}
 	return nil
 }
@@ -391,22 +475,40 @@ func (t *Table) ToArrowSchema() *arrow.Schema {
 	md := map[string]string{
 		MetadataTableName:        t.Name,
 		MetadataTableDescription: t.Description,
+		MetadataTableTitle:       t.Title,
 		MetadataConstraintName:   t.PkConstraintName,
-		MetadataIncremental:      MetadataFalse,
 	}
 	if t.IsIncremental {
 		md[MetadataIncremental] = MetadataTrue
 	}
+	if t.Parent != nil {
+		md[MetadataTableDependsOn] = t.Parent.Name
+	}
+	if t.IsPaid {
+		md[MetadataTableIsPaid] = MetadataTrue
+	}
+	asJSON, _ := json.Marshal(t.PermissionsNeeded)
+	md[MetadataTablePermissionsNeeded] = string(asJSON)
+
 	schemaMd := arrow.MetadataFrom(md)
 	for i, c := range t.Columns {
 		fields[i] = c.ToArrowField()
 	}
+
 	return arrow.NewSchema(fields, &schemaMd)
 }
 
-// Get Changes returns changes between two tables when t is the new one and old is the old one.
+// GetChanges returns changes between two tables when t is the new one and old is the old one.
 func (t *Table) GetChanges(old *Table) []TableColumnChange {
 	var changes []TableColumnChange
+
+	//  Special case: Moving from individual pks to singular PK on _cq_id
+	newPks := t.PrimaryKeys()
+	if len(newPks) == 1 && newPks[0] == CqIDColumn.Name && !funk.Contains(old.PrimaryKeys(), CqIDColumn.Name) && len(old.PrimaryKeys()) > 0 {
+		changes = append(changes, TableColumnChange{
+			Type: TableColumnChangeTypeMoveToCQOnly,
+		})
+	}
 	for _, c := range t.Columns {
 		otherColumn := old.Columns.Get(c.Name)
 		// A column was added to the table definition
@@ -418,12 +520,22 @@ func (t *Table) GetChanges(old *Table) []TableColumnChange {
 			})
 			continue
 		}
+
 		// Column type or options (e.g. PK, Not Null) changed in the new table definition
 		if !arrow.TypeEqual(c.Type, otherColumn.Type) || c.NotNull != otherColumn.NotNull || c.PrimaryKey != otherColumn.PrimaryKey {
 			changes = append(changes, TableColumnChange{
 				Type:       TableColumnChangeTypeUpdate,
 				ColumnName: c.Name,
 				Current:    c,
+				Previous:   *otherColumn,
+			})
+		}
+
+		// Unique constraint was removed
+		if !c.Unique && otherColumn.Unique {
+			changes = append(changes, TableColumnChange{
+				Type:       TableColumnChangeTypeRemoveUniqueConstraint,
+				ColumnName: c.Name,
 				Previous:   *otherColumn,
 			})
 		}
@@ -457,15 +569,6 @@ func (t *Table) ValidateDuplicateColumns() error {
 	return nil
 }
 
-func (t *Table) ValidateColumnNames() error {
-	for _, c := range t.Columns {
-		if !ValidColumnName(c.Name) {
-			return fmt.Errorf("column name %q on table %q is not valid: column names must contain only lower-case letters, numbers and underscores, and must start with a lower-case letter or underscore", c.Name, t.Name)
-		}
-	}
-	return nil
-}
-
 func (t *Table) Column(name string) *Column {
 	for _, c := range t.Columns {
 		if c.Name == name {
@@ -475,6 +578,7 @@ func (t *Table) Column(name string) *Column {
 	return nil
 }
 
+// OverwriteOrAddColumn overwrites or adds columns.
 // If the column with the same name exists, overwrites it.
 // Otherwise, adds the column to the beginning of the table.
 func (t *Table) OverwriteOrAddColumn(column *Column) {
@@ -507,6 +611,17 @@ func (t *Table) IncrementalKeys() []string {
 	}
 
 	return incrementalKeys
+}
+
+func (t *Table) PrimaryKeyComponents() []string {
+	var primaryKeyComponents []string
+	for _, c := range t.Columns {
+		if c.PrimaryKeyComponent {
+			primaryKeyComponents = append(primaryKeyComponents, c.Name)
+		}
+	}
+
+	return primaryKeyComponents
 }
 
 func (t *Table) TableNames() []string {

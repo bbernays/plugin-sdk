@@ -1,19 +1,25 @@
 package schema
 
 import (
-	"github.com/apache/arrow/go/v13/arrow"
+	"github.com/apache/arrow-go/v18/arrow"
 )
 
 const (
-	MetadataUnique         = "cq:extension:unique"
-	MetadataPrimaryKey     = "cq:extension:primary_key"
-	MetadataConstraintName = "cq:extension:constraint_name"
-	MetadataIncremental    = "cq:extension:incremental"
+	MetadataUnique              = "cq:extension:unique"
+	MetadataPrimaryKey          = "cq:extension:primary_key"
+	MetadataPrimaryKeyComponent = "cq:extension:primary_key_component"
+	MetadataConstraintName      = "cq:extension:constraint_name"
+	MetadataIncremental         = "cq:extension:incremental"
+	MetadataTypeSchema          = "cq:extension:type_schema"
 
-	MetadataTrue             = "true"
-	MetadataFalse            = "false"
-	MetadataTableName        = "cq:table_name"
-	MetadataTableDescription = "cq:table_description"
+	MetadataTrue                   = "true"
+	MetadataFalse                  = "false"
+	MetadataTableName              = "cq:table_name"
+	MetadataTableDescription       = "cq:table_description"
+	MetadataTableTitle             = "cq:table_title"
+	MetadataTableDependsOn         = "cq:table_depends_on"
+	MetadataTableIsPaid            = "cq:table_paid"
+	MetadataTablePermissionsNeeded = "cq:table_permissions_needed"
 )
 
 type Schemas []*arrow.Schema

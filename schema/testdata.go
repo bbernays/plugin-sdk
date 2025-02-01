@@ -1,16 +1,16 @@
 package schema
 
 import (
+	"crypto/sha256"
 	"encoding/base64"
 	"fmt"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/apache/arrow/go/v13/arrow"
-	"github.com/apache/arrow/go/v13/arrow/array"
-	"github.com/apache/arrow/go/v13/arrow/memory"
+	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/cloudquery/plugin-sdk/v4/types"
 	"github.com/google/uuid"
 	"golang.org/x/exp/rand"
@@ -190,32 +190,46 @@ type GenTestDataOptions struct {
 	SyncTime time.Time
 	// MaxRows is the number of rows to generate.
 	MaxRows int
-	// StableUUID is the UUID to use for all rows. If set to uuid.Nil, a new UUID will be generated
-	StableUUID uuid.UUID
 	// StableTime is the time to use for all rows other than sync time. If set to time.Time{}, a new time will be generated
 	StableTime time.Time
 	// TimePrecision is the precision to use for time columns.
 	TimePrecision time.Duration
-	// Seed is the seed to use for random data generation.
-	Seed int64
 	// NullRows indicates whether to generate rows with all null values.
 	NullRows bool
+	// UseHomogeneousType indicates whether to use a single type for JSON arrays.
+	UseHomogeneousType bool
 }
 
 type TestDataGenerator struct {
-	counter int
+	counter  int
+	seed     uint64
+	colToRnd map[string]*rand.Rand
 }
 
-func NewTestDataGenerator() *TestDataGenerator {
+func NewTestDataGenerator(randomSeed uint64) *TestDataGenerator {
 	return &TestDataGenerator{
-		counter: 0,
+		counter:  int(randomSeed),
+		seed:     randomSeed,
+		colToRnd: map[string]*rand.Rand{},
 	}
 }
 
-// GenTestData generates a slice of arrow.Records with the given schema and options.
-func (tg *TestDataGenerator) Generate(table *Table, opts GenTestDataOptions) []arrow.Record {
-	var records []arrow.Record
+func (tg *TestDataGenerator) Reset() {
+	tg.counter = 0
+	tg.colToRnd = map[string]*rand.Rand{}
+}
+
+// Generate will produce a single arrow.Record with the given schema and options.
+func (tg *TestDataGenerator) Generate(table *Table, opts GenTestDataOptions) arrow.Record {
 	sc := table.ToArrowSchema()
+	if opts.MaxRows == 0 {
+		// We generate an empty record
+		bldr := array.NewRecordBuilder(memory.DefaultAllocator, sc)
+		defer bldr.Release()
+		return bldr.NewRecord()
+	}
+
+	var records []arrow.Record
 	for j := 0; j < opts.MaxRows; j++ {
 		tg.counter++
 		bldr := array.NewRecordBuilder(memory.DefaultAllocator, sc)
@@ -237,20 +251,26 @@ func (tg *TestDataGenerator) Generate(table *Table, opts GenTestDataOptions) []a
 		records = append(records, bldr.NewRecord())
 		bldr.Release()
 	}
-	if indices := sc.FieldIndices(CqIDColumn.Name); len(indices) > 0 {
-		cqIDIndex := indices[0]
-		sort.Slice(records, func(i, j int) bool {
-			firstUUID := records[i].Column(cqIDIndex).(*types.UUIDArray).Value(0).String()
-			secondUUID := records[j].Column(cqIDIndex).(*types.UUIDArray).Value(0).String()
-			return strings.Compare(firstUUID, secondUUID) < 0
-		})
+
+	arrowTable := array.NewTableFromRecords(sc, records)
+	columns := make([]arrow.Array, sc.NumFields())
+	for n := 0; n < sc.NumFields(); n++ {
+		concatenated, err := array.Concatenate(arrowTable.Column(n).Data().Chunks(), memory.DefaultAllocator)
+		if err != nil {
+			panic(fmt.Sprintf("failed to concatenate arrays: %v", err))
+		}
+		columns[n] = concatenated
 	}
-	return records
+
+	return array.NewRecord(sc, columns, -1)
 }
 
 func (tg TestDataGenerator) getExampleJSON(colName string, dataType arrow.DataType, opts GenTestDataOptions) string {
-	src := rand.NewSource(uint64(opts.Seed))
-	rnd := rand.New(src)
+	var rnd, found = tg.colToRnd[colName]
+	if !found {
+		tg.colToRnd[colName] = rand.New(rand.NewSource(tg.seed))
+		rnd = tg.colToRnd[colName]
+	}
 
 	// special case for auto-incrementing id column, used for to determine ordering in tests
 	if arrow.IsInteger(dataType.ID()) && colName == "id" {
@@ -262,7 +282,6 @@ func (tg TestDataGenerator) getExampleJSON(colName string, dataType arrow.DataTy
 		if dataType.ID() == arrow.MAP {
 			k := tg.getExampleJSON(colName, dataType.(*arrow.MapType).KeyType(), opts)
 			v := tg.getExampleJSON(colName, dataType.(*arrow.MapType).ItemType(), opts)
-			opts.Seed++
 			k2 := tg.getExampleJSON(colName, dataType.(*arrow.MapType).KeyType(), opts)
 			v2 := tg.getExampleJSON(colName, dataType.(*arrow.MapType).ItemType(), opts)
 			return fmt.Sprintf(`[{"key": %s,"value": %s},{"key": %s,"value": %s}]`, k, v, k2, v2)
@@ -272,15 +291,21 @@ func (tg TestDataGenerator) getExampleJSON(colName string, dataType arrow.DataTy
 	}
 	// handle extension types
 	if arrow.TypeEqual(dataType, types.ExtensionTypes.UUID) {
-		u := uuid.New()
-		if opts.StableUUID != uuid.Nil {
-			u = opts.StableUUID
-		}
+		// This will make UUIDs deterministic like all other types
+		hash := sha256.New()
+		hash.Write([]byte(fmt.Sprintf(`"AString%d"`, rnd.Intn(100000))))
+		u := uuid.NewSHA1(uuid.UUID{}, hash.Sum(nil))
 		return `"` + u.String() + `"`
 	}
 	if arrow.TypeEqual(dataType, types.ExtensionTypes.JSON) {
 		if strings.HasSuffix(colName, "_array") {
+			if opts.UseHomogeneousType {
+				return `[{"test1":"test1"},{"test2":"test2"},{"test3":"test3"}]`
+			}
 			return `[{"test":"test"},123,{"test_number":456}]`
+		}
+		if opts.UseHomogeneousType {
+			return `{"test":["a", "b", "c"]}`
 		}
 		return `{"test":["a","b",3]}`
 	}

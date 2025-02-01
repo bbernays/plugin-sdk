@@ -7,8 +7,9 @@ import (
 	"reflect"
 	"strings"
 
-	"github.com/apache/arrow/go/v13/arrow"
-	"github.com/apache/arrow/go/v13/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/goccy/go-json"
 )
 
@@ -16,8 +17,8 @@ type InetBuilder struct {
 	*array.ExtensionBuilder
 }
 
-func NewInetBuilder(builder *array.ExtensionBuilder) *InetBuilder {
-	return &InetBuilder{ExtensionBuilder: builder}
+func NewInetBuilder(mem memory.Allocator) *InetBuilder {
+	return &InetBuilder{ExtensionBuilder: array.NewExtensionBuilder(mem, NewInetType())}
 }
 
 func (b *InetBuilder) Append(v *net.IPNet) {
@@ -67,17 +68,20 @@ func (b *InetBuilder) UnmarshalOne(dec *json.Decoder) error {
 	}
 
 	var val *net.IPNet
+	var ip net.IP
 	switch v := t.(type) {
 	case string:
-		_, val, err = net.ParseCIDR(v)
+		ip, val, err = net.ParseCIDR(v)
 		if err != nil {
 			return err
 		}
+		val.IP = ip
 	case []byte:
-		_, val, err = net.ParseCIDR(string(v))
+		ip, val, err = net.ParseCIDR(string(v))
 		if err != nil {
 			return err
 		}
+		val.IP = ip
 	case nil:
 		b.AppendNull()
 		return nil
@@ -156,10 +160,11 @@ func (a *InetArray) Value(i int) *net.IPNet {
 			Mask: make(net.IPMask, len(net.IPv4zero)),
 		}
 	}
-	_, ipnet, err := net.ParseCIDR(cidr)
+	ip, ipnet, err := net.ParseCIDR(cidr)
 	if err != nil {
 		panic(fmt.Errorf("invalid ip+net: %w", err))
 	}
+	ipnet.IP = ip
 
 	return ipnet
 }
@@ -240,6 +245,6 @@ func (u *InetType) ExtensionEquals(other arrow.ExtensionType) bool {
 	return u.ExtensionName() == other.ExtensionName()
 }
 
-func (*InetType) NewBuilder(bldr *array.ExtensionBuilder) array.Builder {
-	return NewInetBuilder(bldr)
+func (*InetType) NewBuilder(mem memory.Allocator) array.Builder {
+	return NewInetBuilder(mem)
 }

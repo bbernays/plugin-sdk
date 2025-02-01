@@ -1,44 +1,56 @@
 package schema
 
 import (
+	"fmt"
 	"testing"
 
-	"github.com/apache/arrow/go/v13/arrow"
-	"github.com/stretchr/testify/assert"
+	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/memory"
+	"github.com/cloudquery/plugin-sdk/v4/types"
+	"github.com/stretchr/testify/require"
 )
 
-func TestTableValidators(t *testing.T) {
-	var testTableValidators = Table{
-		Name: "test_table_validator",
-		Columns: []Column{
-			{
-				Name: "zero_bool",
-				Type: arrow.FixedWidthTypes.Boolean,
-			},
-			{
-				Name: "zero_int",
-				Type: arrow.PrimitiveTypes.Int64,
-			},
-			{
-				Name: "not_zero_bool",
-				Type: arrow.FixedWidthTypes.Boolean,
-			},
+func TestFindEmptyColumns(t *testing.T) {
+	table := TestTable("test", TestSourceOptions{})
+	tg := NewTestDataGenerator(0)
+	record := tg.Generate(table, GenTestDataOptions{
+		MaxRows:  1,
+		NullRows: true,
+	})
+	v := FindEmptyColumns(table, []arrow.Record{record})
+	require.NotEmpty(t, v)
+	require.Len(t, v, len(table.Columns)-1) // exclude "id"
+}
+
+func TestFindEmptyColumnsNotEmpty(t *testing.T) {
+	table := TestTable("test", TestSourceOptions{})
+	tg := NewTestDataGenerator(0)
+	record := tg.Generate(table, GenTestDataOptions{
+		MaxRows:  1,
+		NullRows: false,
+	})
+	v := FindEmptyColumns(table, []arrow.Record{record})
+	require.Empty(t, v)
+}
+
+func TestFindEmptyColumnsJSON(t *testing.T) {
+	table := &Table{
+		Name: "test",
+		Columns: ColumnList{
+			{Name: "json", Type: types.ExtensionTypes.JSON},
 		},
 	}
+	sc := table.ToArrowSchema()
+	bldr := array.NewRecordBuilder(memory.DefaultAllocator, sc)
+	err := bldr.Field(0).UnmarshalJSON([]byte(`[{}]`))
+	if err != nil {
+		panic(fmt.Sprintf("failed to unmarshal json for column: %v", err))
+	}
+	records := []arrow.Record{bldr.NewRecord()}
+	bldr.Release()
 
-	// table has passed all validators
-	err := ValidateTable(&testTableValidators)
-	assert.Nil(t, err)
-
-	// table name is too long
-	tableWithLongName := testTableValidators
-	tableWithLongName.Name = "WithLongNametableWithLongNametableWithLongNametableWithLongNamet"
-	err = ValidateTable(&tableWithLongName)
-	assert.Error(t, err)
-
-	// column name is too long
-	tableWithLongColumnName := testTableValidators
-	tableWithLongName.Columns[0].Name = "tableWithLongColumnNametableWithLongColumnNametableWithLongColumnName"
-	err = ValidateTable(&tableWithLongColumnName)
-	assert.Error(t, err)
+	v := FindEmptyColumns(table, records)
+	require.NotEmpty(t, v)
+	require.Len(t, v, 1)
 }

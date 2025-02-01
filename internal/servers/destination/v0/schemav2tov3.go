@@ -4,9 +4,9 @@ import (
 	"encoding/json"
 	"strings"
 
-	"github.com/apache/arrow/go/v13/arrow"
-	"github.com/apache/arrow/go/v13/arrow/array"
-	"github.com/apache/arrow/go/v13/arrow/memory"
+	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/memory"
 	schemav2 "github.com/cloudquery/plugin-sdk/v2/schema"
 	"github.com/cloudquery/plugin-sdk/v4/schema"
 	"github.com/cloudquery/plugin-sdk/v4/types"
@@ -56,8 +56,6 @@ func ColumnV2ToV3(column schemav2.Column) schema.Column {
 }
 
 func TypeV2ToV3(dataType schemav2.ValueType) arrow.DataType {
-	var typ arrow.DataType
-
 	switch dataType {
 	case schemav2.TypeBool:
 		return arrow.FixedWidthTypes.Boolean
@@ -94,7 +92,7 @@ func TypeV2ToV3(dataType schemav2.ValueType) arrow.DataType {
 	case schemav2.TypeMacAddrArray:
 		return arrow.ListOf(types.ExtensionTypes.MAC)
 	default:
-		panic("unknown type " + typ.Name())
+		panic("unknown type " + dataType.String())
 	}
 }
 

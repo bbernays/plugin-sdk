@@ -1,9 +1,10 @@
 package message
 
 import (
-	"github.com/apache/arrow/go/v13/arrow"
+	"slices"
+
+	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/cloudquery/plugin-sdk/v4/schema"
-	"golang.org/x/exp/slices"
 )
 
 type syncBaseMessage struct {
@@ -97,6 +98,7 @@ func (m SyncInserts) GetRecords() []arrow.Record {
 	return res
 }
 
+// Get all records for a single table
 func (m SyncInserts) GetRecordsForTable(table *schema.Table) []arrow.Record {
 	res := make([]arrow.Record, 0, len(m))
 	for _, insert := range m {
@@ -108,4 +110,14 @@ func (m SyncInserts) GetRecordsForTable(table *schema.Table) []arrow.Record {
 		res = append(res, insert.Record)
 	}
 	return slices.Clip(res)
+}
+
+type SyncDeleteRecord struct {
+	syncBaseMessage
+	// TODO: Instead of using this struct we should derive the DeletionKeys and parent/child relation from the schema.Table itself
+	DeleteRecord
+}
+
+func (m SyncDeleteRecord) GetTable() *schema.Table {
+	return &schema.Table{Name: m.TableName}
 }

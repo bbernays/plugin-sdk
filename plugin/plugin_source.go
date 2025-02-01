@@ -15,12 +15,18 @@ type BackendOptions struct {
 	Connection string
 }
 
+type Shard struct {
+	Num   int32
+	Total int32
+}
+
 type SyncOptions struct {
 	Tables              []string
 	SkipTables          []string
 	SkipDependentTables bool
 	DeterministicCQID   bool
 	BackendOptions      *BackendOptions
+	Shard               *Shard
 }
 
 type SourceClient interface {
@@ -48,7 +54,7 @@ type NewSourceClientFunc func(context.Context, zerolog.Logger, any) (SourceClien
 // NewSourcePlugin returns a new CloudQuery Plugin with the given name, version and implementation.
 // Source plugins only support read operations. For Read & Write plugin use NewPlugin.
 func NewSourcePlugin(name string, version string, newClient NewSourceClientFunc, options ...Option) *Plugin {
-	newClientWrapper := func(ctx context.Context, logger zerolog.Logger, spec []byte, options NewClientOptions) (Client, error) {
+	newClientWrapper := func(ctx context.Context, logger zerolog.Logger, spec []byte, _ NewClientOptions) (Client, error) {
 		sourceClient, err := newClient(ctx, logger, spec)
 		if err != nil {
 			return nil, err
@@ -88,12 +94,10 @@ func (p *Plugin) Sync(ctx context.Context, options SyncOptions, res chan<- messa
 	if p.client == nil {
 		return fmt.Errorf("plugin not initialized. call Init() first")
 	}
-	// startTime := time.Now()
 
 	if err := p.client.Sync(ctx, options, res); err != nil {
 		return fmt.Errorf("failed to sync unmanaged client: %w", err)
 	}
 
-	// p.logger.Info().Uint64("resources", p.metrics.TotalResources()).Uint64("errors", p.metrics.TotalErrors()).Uint64("panics", p.metrics.TotalPanics()).TimeDiff("duration", time.Now(), startTime).Msg("sync finished")
 	return nil
 }

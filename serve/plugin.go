@@ -9,7 +9,9 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/cloudquery/plugin-sdk/v4/helpers/grpczerolog"
 	"github.com/cloudquery/plugin-sdk/v4/plugin"
+	"github.com/cloudquery/plugin-sdk/v4/premium"
 	"github.com/cloudquery/plugin-sdk/v4/types"
 
 	pbDestinationV0 "github.com/cloudquery/plugin-pb-go/pb/destination/v0"
@@ -23,13 +25,10 @@ import (
 	serverDestinationV0 "github.com/cloudquery/plugin-sdk/v4/internal/servers/destination/v0"
 	serverDestinationV1 "github.com/cloudquery/plugin-sdk/v4/internal/servers/destination/v1"
 	serversv3 "github.com/cloudquery/plugin-sdk/v4/internal/servers/plugin/v3"
-	"github.com/getsentry/sentry-go"
-	grpczerolog "github.com/grpc-ecosystem/go-grpc-middleware/providers/zerolog/v2"
 	"github.com/grpc-ecosystem/go-grpc-middleware/v2/interceptors/logging"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	"github.com/spf13/cobra"
-	"github.com/thoas/go-funk"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/test/bufconn"
 )
@@ -38,18 +37,12 @@ type PluginServe struct {
 	plugin                *plugin.Plugin
 	args                  []string
 	destinationV0V1Server bool
-	sentryDSN             string
 	testListener          bool
 	testListenerConn      *bufconn.Listener
+	versions              []int
 }
 
 type PluginOption func(*PluginServe)
-
-func WithPluginSentryDSN(dsn string) PluginOption {
-	return func(s *PluginServe) {
-		s.sentryDSN = dsn
-	}
-}
 
 // WithDestinationV0V1Server is used to include destination v0 and v1 server to work
 // with older sources
@@ -79,7 +72,8 @@ const servePluginShort = `Start plugin server`
 
 func Plugin(p *plugin.Plugin, opts ...PluginOption) *PluginServe {
 	s := &PluginServe{
-		plugin: p,
+		plugin:   p,
+		versions: []int{3},
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -111,12 +105,15 @@ func (s *PluginServe) newCmdPluginServe() *cobra.Command {
 	var address string
 	var network string
 	var noSentry bool
+	var otelEndpoint string
+	var otelEndpointInsecure bool
+	var licenseFile string
 	logLevel := newEnum([]string{"trace", "debug", "info", "warn", "error"}, "info")
 	logFormat := newEnum([]string{"text", "json"}, "text")
 	telemetryLevel := newEnum([]string{"none", "errors", "stats", "all"}, "all")
 	err := telemetryLevel.Set(getEnvOrDefault("CQ_TELEMETRY_LEVEL", telemetryLevel.Value))
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "failed to set telemetry level: "+err.Error())
+		fmt.Fprint(os.Stderr, "failed to set telemetry level: "+err.Error())
 		os.Exit(1)
 	}
 
@@ -125,7 +122,7 @@ func (s *PluginServe) newCmdPluginServe() *cobra.Command {
 		Short: servePluginShort,
 		Long:  servePluginShort,
 		Args:  cobra.NoArgs,
-		RunE: func(cmd *cobra.Command, args []string) error {
+		RunE: func(cmd *cobra.Command, _ []string) error {
 			zerologLevel, err := zerolog.ParseLevel(logLevel.String())
 			if err != nil {
 				return err
@@ -136,7 +133,31 @@ func (s *PluginServe) newCmdPluginServe() *cobra.Command {
 			} else {
 				logger = log.Output(zerolog.ConsoleWriter{Out: os.Stdout}).Level(zerologLevel)
 			}
-			// opts.Plugin.Logger = logger
+
+			logger = logger.With().Str("module", s.plugin.Name()+"-"+string(s.plugin.Kind())).Logger()
+
+			shutdown, err := setupOtel(cmd.Context(), logger, s.plugin, otelEndpoint, otelEndpointInsecure)
+			if err != nil {
+				return fmt.Errorf("failed to setup OpenTelemetry: %w", err)
+			}
+			if shutdown != nil {
+				logger = logger.Hook(newOTELLoggerHook())
+				defer shutdown()
+			}
+
+			licenseClient, err := premium.NewLicenseClient(cmd.Context(), logger, premium.WithMeta(s.plugin.Meta()), premium.WithLicenseFileOrDirectory(licenseFile))
+			if err != nil {
+				return fmt.Errorf("failed to create license client: %w", err)
+			}
+			switch err := licenseClient.ValidateLicense(cmd.Context()); err {
+			case nil:
+				s.plugin.SetSkipUsageClient(true)
+			case premium.ErrLicenseNotApplicable:
+				// no-op: Treat as if no license was provided
+			default:
+				return fmt.Errorf("failed to validate license: %w", err)
+			}
+
 			var listener net.Listener
 			if s.testListener {
 				listener = s.testListenerConn
@@ -163,9 +184,8 @@ func (s *PluginServe) newCmdPluginServe() *cobra.Command {
 			)
 			s.plugin.SetLogger(logger)
 			pbv3.RegisterPluginServer(grpcServer, &serversv3.Server{
-				Plugin:   s.plugin,
-				Logger:   logger,
-				NoSentry: noSentry,
+				Plugin: s.plugin,
+				Logger: logger,
 			})
 			if s.destinationV0V1Server {
 				pbDestinationV1.RegisterDestinationServer(grpcServer, &serverDestinationV1.Server{
@@ -183,33 +203,6 @@ func (s *PluginServe) newCmdPluginServe() *cobra.Command {
 			pbdiscoveryv1.RegisterDiscoveryServer(grpcServer, &discoveryServerV1.Server{
 				Versions: []int32{0, 1, 2, 3},
 			})
-
-			version := s.plugin.Version()
-
-			if s.sentryDSN != "" && !strings.EqualFold(version, "development") && !noSentry {
-				err = sentry.Init(sentry.ClientOptions{
-					Dsn:              s.sentryDSN,
-					Debug:            false,
-					AttachStacktrace: false,
-					Release:          version,
-					Transport:        sentry.NewHTTPSyncTransport(),
-					ServerName:       "oss", // set to "oss" on purpose to avoid sending any identifying information
-					// https://docs.sentry.io/platforms/go/configuration/options/#removing-default-integrations
-					Integrations: func(integrations []sentry.Integration) []sentry.Integration {
-						var filteredIntegrations []sentry.Integration
-						for _, integration := range integrations {
-							if integration.Name() == "Modules" {
-								continue
-							}
-							filteredIntegrations = append(filteredIntegrations, integration)
-						}
-						return filteredIntegrations
-					},
-				})
-				if err != nil {
-					log.Error().Err(err).Msg("Error initializing sentry")
-				}
-			}
 
 			ctx := cmd.Context()
 			c := make(chan os.Signal, 1)
@@ -240,11 +233,10 @@ func (s *PluginServe) newCmdPluginServe() *cobra.Command {
 	cmd.Flags().StringVar(&network, "network", "tcp", `the network must be "tcp", "tcp4", "tcp6", "unix" or "unixpacket"`)
 	cmd.Flags().Var(logLevel, "log-level", fmt.Sprintf("log level. one of: %s", strings.Join(logLevel.Allowed, ",")))
 	cmd.Flags().Var(logFormat, "log-format", fmt.Sprintf("log format. one of: %s", strings.Join(logFormat.Allowed, ",")))
+	cmd.Flags().StringVar(&otelEndpoint, "otel-endpoint", "", "Open Telemetry HTTP collector endpoint")
+	cmd.Flags().BoolVar(&otelEndpointInsecure, "otel-endpoint-insecure", false, "use Open Telemetry HTTP endpoint (for development only)")
 	cmd.Flags().BoolVar(&noSentry, "no-sentry", false, "disable sentry")
-	sendErrors := funk.ContainsString([]string{"all", "errors"}, telemetryLevel.String())
-	if !sendErrors {
-		noSentry = true
-	}
+	cmd.Flags().StringVar(&licenseFile, "license", "", "Path to offline license file or directory")
 
 	return cmd
 }
@@ -255,6 +247,8 @@ func (s *PluginServe) newCmdPluginRoot() *cobra.Command {
 	}
 	cmd.AddCommand(s.newCmdPluginServe())
 	cmd.AddCommand(s.newCmdPluginDoc())
+	cmd.AddCommand(s.newCmdPluginPackage())
+	cmd.AddCommand(s.newCmdPluginInfo())
 	cmd.CompletionOptions.DisableDefaultCmd = true
 	cmd.Version = s.plugin.Version()
 	return cmd

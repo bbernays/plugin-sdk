@@ -12,12 +12,17 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Git checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
+      - run: |
+          venv="$HOME/.local/share/venv"
+          python3 -m venv "$venv"
+          echo "$venv/bin" >> $GITHUB_PATH
       - name: Vale
-        uses: errata-ai/vale-action@v2
+        uses: errata-ai/vale-action@2690bc95f0ed3cb5220492575af09c51b04fbea9
         with:
-          vale_flags: "--glob=!{docs/testdata/*,CHANGELOG.md,.github/styles/proselint/README.md}"
+          vale_flags: "--glob=!{docs/testdata/*,CHANGELOG.md,.github/styles/proselint/README.md,examples/simple_plugin/docs/*.md}"
           filter_mode: nofilter
+          version: '3.0.3'
         env:
           GITHUB_TOKEN: ${{secrets.GITHUB_TOKEN}}
   lint-structure:
@@ -25,10 +30,10 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Git checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
       - name: markdownlint-cli
-        uses: nosborn/github-action-markdown-cli@v3.3.0
+        uses: nosborn/github-action-markdown-cli@v3.4.0
         with:
           files: .
           config_file: .markdownlint.yaml
-          ignore_files: "{docs/testdata/*,CHANGELOG.md}"
+          ignore_files: "{docs/testdata/*,CHANGELOG.md,examples/simple_plugin/docs/*.md}"

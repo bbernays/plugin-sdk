@@ -1,114 +1,41 @@
 package scheduler
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"runtime/debug"
-	"sync/atomic"
+	"sync"
 	"time"
 
-	"github.com/apache/arrow/go/v13/arrow/array"
-	"github.com/apache/arrow/go/v13/arrow/memory"
 	"github.com/cloudquery/plugin-sdk/v4/caser"
 	"github.com/cloudquery/plugin-sdk/v4/message"
-	"github.com/cloudquery/plugin-sdk/v4/scalar"
+	"github.com/cloudquery/plugin-sdk/v4/scheduler/metrics"
 	"github.com/cloudquery/plugin-sdk/v4/schema"
-	"github.com/getsentry/sentry-go"
 	"github.com/rs/zerolog"
-	"github.com/thoas/go-funk"
+	"github.com/samber/lo"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/sync/semaphore"
 )
 
 const (
-	DefaultConcurrency     = 50000
-	DefaultMaxDepth        = 4
-	minTableConcurrency    = 1
-	minResourceConcurrency = 100
+	DefaultSingleResourceMaxConcurrency    = 5
+	DefaultSingleNestedTableMaxConcurrency = 5
+	DefaultConcurrency                     = 50000
+	DefaultMaxDepth                        = 4
+	minTableConcurrency                    = 1
+	minResourceConcurrency                 = 100
 )
+
+var ErrNoTables = errors.New("no tables specified for syncing, review `tables` and `skip_tables` in your config and specify at least one table to sync")
 
 const (
 	StrategyDFS Strategy = iota
 	StrategyRoundRobin
+	StrategyShuffle
+	StrategyShuffleQueue
 )
-
-type Strategy int
-
-func (s *Strategy) String() string {
-	if s == nil {
-		return ""
-	}
-	return AllStrategyNames[*s]
-}
-
-// MarshalJSON implements json.Marshaler.
-func (s *Strategy) MarshalJSON() ([]byte, error) {
-	var b bytes.Buffer
-	if s == nil {
-		b.Write([]byte("null"))
-		return b.Bytes(), nil
-	}
-	b.Write([]byte{'"'})
-	b.Write([]byte(s.String()))
-	b.Write([]byte{'"'})
-	return b.Bytes(), nil
-}
-
-// UnmarshalJSON implements json.Unmarshaler.
-func (s *Strategy) UnmarshalJSON(b []byte) error {
-	var name string
-	if err := json.Unmarshal(b, &name); err != nil {
-		return err
-	}
-	strategy, err := StrategyForName(name)
-	if err != nil {
-		return err
-	}
-	*s = strategy
-	return nil
-}
-
-func (s *Strategy) Validate() error {
-	if s == nil {
-		return errors.New("scheduler strategy is nil")
-	}
-	for _, strategy := range AllStrategies {
-		if strategy == *s {
-			return nil
-		}
-	}
-	return fmt.Errorf("unknown scheduler strategy: %d", s)
-}
-
-var AllStrategies = Strategies{StrategyDFS, StrategyRoundRobin}
-var AllStrategyNames = [...]string{
-	StrategyDFS:        "dfs",
-	StrategyRoundRobin: "round-robin",
-}
-
-func StrategyForName(s string) (Strategy, error) {
-	for i, name := range AllStrategyNames {
-		if name == s {
-			return AllStrategies[i], nil
-		}
-	}
-	return StrategyDFS, fmt.Errorf("unknown scheduler strategy: %s", s)
-}
-
-type Strategies []Strategy
-
-func (s Strategies) String() string {
-	var buffer bytes.Buffer
-	for i, strategy := range s {
-		if i > 0 {
-			buffer.WriteString(", ")
-		}
-		buffer.WriteString(strategy.String())
-	}
-	return buffer.String()
-}
 
 type Option func(*Scheduler)
 
@@ -136,11 +63,35 @@ func WithStrategy(strategy Strategy) Option {
 	}
 }
 
+func WithSingleNestedTableMaxConcurrency(concurrency int64) Option {
+	return func(s *Scheduler) {
+		s.singleNestedTableMaxConcurrency = concurrency
+	}
+}
+
+func WithSingleResourceMaxConcurrency(concurrency int64) Option {
+	return func(s *Scheduler) {
+		s.singleResourceMaxConcurrency = concurrency
+	}
+}
+
 type SyncOption func(*syncClient)
 
 func WithSyncDeterministicCQID(deterministicCQID bool) SyncOption {
 	return func(s *syncClient) {
 		s.deterministicCQID = deterministicCQID
+	}
+}
+
+func WithInvocationID(invocationID string) Option {
+	return func(s *Scheduler) {
+		s.invocationID = invocationID
+	}
+}
+
+func WithShard(num int32, total int32) SyncOption {
+	return func(s *syncClient) {
+		s.shard = &shard{num: num, total: total}
 	}
 }
 
@@ -159,6 +110,23 @@ type Scheduler struct {
 	// Logger to call, this logger is passed to the serve.Serve Client, if not defined Serve will create one instead.
 	logger      zerolog.Logger
 	concurrency int
+	// This Map holds all of the concurrency semaphores for each table+client pair.
+	singleTableConcurrency sync.Map
+	// The maximum number of go routines that can be spawned for a single table+client pair
+	singleNestedTableMaxConcurrency int64
+
+	// The maximum number of go routines that can be spawned for a specific resource
+	singleResourceMaxConcurrency int64
+
+	// Controls how records are constructed on the source side.
+	batchSettings *BatchSettings
+
+	invocationID string
+}
+
+type shard struct {
+	num   int32
+	total int32
 }
 
 type syncClient struct {
@@ -167,23 +135,38 @@ type syncClient struct {
 	scheduler         *Scheduler
 	deterministicCQID bool
 	// status sync metrics
-	metrics *Metrics
-	logger  zerolog.Logger
+	metrics      *metrics.Metrics
+	logger       zerolog.Logger
+	invocationID string
+
+	shard *shard
 }
 
 func NewScheduler(opts ...Option) *Scheduler {
 	s := Scheduler{
-		caser:       caser.New(),
-		concurrency: DefaultConcurrency,
-		maxDepth:    DefaultMaxDepth,
+		caser:                           caser.New(),
+		concurrency:                     DefaultConcurrency,
+		maxDepth:                        DefaultMaxDepth,
+		singleResourceMaxConcurrency:    DefaultSingleResourceMaxConcurrency,
+		singleNestedTableMaxConcurrency: DefaultSingleNestedTableMaxConcurrency,
+		batchSettings: &BatchSettings{
+			MaxRows: DefaultBatchMaxRows,
+			Timeout: DefaultBatchTimeout,
+		},
 	}
 	for _, opt := range opts {
 		opt(&s)
 	}
+
+	actualMinResourceConcurrency := minResourceConcurrency
+	if s.concurrency <= minResourceConcurrency {
+		actualMinResourceConcurrency = max(s.concurrency/10, 1)
+	}
+
 	// This is very similar to the concurrent web crawler problem with some minor changes.
 	// We are using DFS/Round-Robin to make sure memory usage is capped at O(h) where h is the height of the tree.
-	tableConcurrency := max(s.concurrency/minResourceConcurrency, minTableConcurrency)
-	resourceConcurrency := tableConcurrency * minResourceConcurrency
+	tableConcurrency := max(s.concurrency/actualMinResourceConcurrency, minTableConcurrency)
+	resourceConcurrency := tableConcurrency * actualMinResourceConcurrency
 	s.tableSems = make([]*semaphore.Weighted, s.maxDepth)
 	for i := uint64(0); i < s.maxDepth; i++ {
 		s.tableSems[i] = semaphore.NewWeighted(int64(tableConcurrency))
@@ -191,6 +174,7 @@ func NewScheduler(opts ...Option) *Scheduler {
 		tableConcurrency = max(tableConcurrency/2, minTableConcurrency)
 	}
 	s.resourceSem = semaphore.NewWeighted(int64(resourceConcurrency))
+
 	return &s
 }
 
@@ -212,16 +196,22 @@ func (s *Scheduler) SyncAll(ctx context.Context, client schema.ClientMeta, table
 }
 
 func (s *Scheduler) Sync(ctx context.Context, client schema.ClientMeta, tables schema.Tables, res chan<- message.SyncMessage, opts ...SyncOption) error {
+	ctx, span := otel.Tracer(metrics.OtelName).Start(ctx,
+		"sync",
+		trace.WithAttributes(attribute.Key("sync.invocation.id").String(s.invocationID)),
+	)
+	defer span.End()
 	if len(tables) == 0 {
-		return nil
+		return ErrNoTables
 	}
 
 	syncClient := &syncClient{
-		metrics:   &Metrics{TableClient: make(map[string]map[string]*TableClientMetrics)},
-		tables:    tables,
-		client:    client,
-		scheduler: s,
-		logger:    s.logger,
+		metrics:      &metrics.Metrics{TableClient: make(map[string]map[string]*metrics.TableClientMetrics)},
+		tables:       tables,
+		client:       client,
+		scheduler:    s,
+		logger:       s.logger,
+		invocationID: s.invocationID,
 	}
 	for _, opt := range opts {
 		opt(syncClient)
@@ -232,142 +222,67 @@ func (s *Scheduler) Sync(ctx context.Context, client schema.ClientMeta, tables s
 	}
 
 	// send migrate messages first
-	for _, table := range tables.FlattenTables() {
-		res <- &message.SyncMigrateTable{
-			Table: table,
+	for _, tableOriginal := range tables.FlattenTables() {
+		migrateMessage := &message.SyncMigrateTable{
+			Table: tableOriginal.Copy(tableOriginal.Parent),
 		}
+		if syncClient.deterministicCQID {
+			schema.CqIDAsPK(migrateMessage.Table)
+		}
+		res <- migrateMessage
 	}
 
 	resources := make(chan *schema.Resource)
 	go func() {
 		defer close(resources)
+		testMultiplier, err := getTestMultiplier()
+		if err != nil {
+			panic(err)
+		}
+		if testMultiplier > 0 {
+			syncClient.syncTest(ctx, testMultiplier, resources)
+			return
+		}
 		switch s.strategy {
 		case StrategyDFS:
 			syncClient.syncDfs(ctx, resources)
 		case StrategyRoundRobin:
 			syncClient.syncRoundRobin(ctx, resources)
+		case StrategyShuffle:
+			syncClient.syncShuffle(ctx, resources)
+		case StrategyShuffleQueue:
+			syncClient.syncShuffleQueue(ctx, resources)
 		default:
 			panic(fmt.Errorf("unknown scheduler %s", s.strategy.String()))
 		}
 	}()
+
+	b := s.batchSettings.getBatcher(ctx, res, s.logger)
+	defer b.close()    // wait for all resources to be processed
+	done := ctx.Done() // no need to do the lookups in loop
 	for resource := range resources {
-		vector := resource.GetValues()
-		bldr := array.NewRecordBuilder(memory.DefaultAllocator, resource.Table.ToArrowSchema())
-		scalar.AppendToRecordBuilder(bldr, vector)
-		rec := bldr.NewRecord()
-		res <- &message.SyncInsert{Record: rec}
+		select {
+		case <-done:
+			s.logger.Debug().Msg("sync context cancelled")
+			return context.Cause(ctx)
+		default:
+			b.process(resource)
+		}
 	}
-	return nil
+	return context.Cause(ctx)
 }
 
 func (s *syncClient) logTablesMetrics(tables schema.Tables, client Client) {
 	clientName := client.ID()
 	for _, table := range tables {
-		metrics := s.metrics.TableClient[table.Name][clientName]
-		s.logger.Info().Str("table", table.Name).Str("client", clientName).Uint64("resources", metrics.Resources).Uint64("errors", metrics.Errors).Msg("table sync finished")
+		m := s.metrics.TableClient[table.Name][clientName]
+		duration := m.Duration.Load()
+		if duration == nil {
+			// This can happen for a relation when there are no resources to resolve from the parent
+			duration = new(time.Duration)
+		}
+		s.logger.Info().Str("table", table.Name).Str("client", clientName).Uint64("resources", m.Resources).Dur("duration_ms", *duration).Uint64("errors", m.Errors).Msg("table sync finished")
 		s.logTablesMetrics(table.Relations, client)
-	}
-}
-
-func (s *syncClient) resolveResource(ctx context.Context, table *schema.Table, client schema.ClientMeta, parent *schema.Resource, item any) *schema.Resource {
-	var validationErr *schema.ValidationError
-	ctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
-	defer cancel()
-	resource := schema.NewResourceData(table, parent, item)
-	objectStartTime := time.Now()
-	clientID := client.ID()
-	tableMetrics := s.metrics.TableClient[table.Name][clientID]
-	logger := s.logger.With().Str("table", table.Name).Str("client", clientID).Logger()
-	defer func() {
-		if err := recover(); err != nil {
-			stack := fmt.Sprintf("%s\n%s", err, string(debug.Stack()))
-			logger.Error().Interface("error", err).TimeDiff("duration", time.Now(), objectStartTime).Str("stack", stack).Msg("resource resolver finished with panic")
-			atomic.AddUint64(&tableMetrics.Panics, 1)
-			sentry.WithScope(func(scope *sentry.Scope) {
-				scope.SetTag("table", table.Name)
-				sentry.CurrentHub().CaptureMessage(stack)
-			})
-		}
-	}()
-	if table.PreResourceResolver != nil {
-		if err := table.PreResourceResolver(ctx, client, resource); err != nil {
-			logger.Error().Err(err).Msg("pre resource resolver failed")
-			atomic.AddUint64(&tableMetrics.Errors, 1)
-			if errors.As(err, &validationErr) {
-				sentry.WithScope(func(scope *sentry.Scope) {
-					scope.SetTag("table", table.Name)
-					sentry.CurrentHub().CaptureMessage(validationErr.MaskedError())
-				})
-			}
-			return nil
-		}
-	}
-
-	for _, c := range table.Columns {
-		s.resolveColumn(ctx, logger, tableMetrics, client, resource, c)
-	}
-
-	if table.PostResourceResolver != nil {
-		if err := table.PostResourceResolver(ctx, client, resource); err != nil {
-			logger.Error().Stack().Err(err).Msg("post resource resolver finished with error")
-			atomic.AddUint64(&tableMetrics.Errors, 1)
-			if errors.As(err, &validationErr) {
-				sentry.WithScope(func(scope *sentry.Scope) {
-					scope.SetTag("table", table.Name)
-					sentry.CurrentHub().CaptureMessage(validationErr.MaskedError())
-				})
-			}
-		}
-	}
-	atomic.AddUint64(&tableMetrics.Resources, 1)
-	return resource
-}
-
-func (s *syncClient) resolveColumn(ctx context.Context, logger zerolog.Logger, tableMetrics *TableClientMetrics, client schema.ClientMeta, resource *schema.Resource, c schema.Column) {
-	var validationErr *schema.ValidationError
-	columnStartTime := time.Now()
-	defer func() {
-		if err := recover(); err != nil {
-			stack := fmt.Sprintf("%s\n%s", err, string(debug.Stack()))
-			logger.Error().Str("column", c.Name).Interface("error", err).TimeDiff("duration", time.Now(), columnStartTime).Str("stack", stack).Msg("column resolver finished with panic")
-			atomic.AddUint64(&tableMetrics.Panics, 1)
-			sentry.WithScope(func(scope *sentry.Scope) {
-				scope.SetTag("table", resource.Table.Name)
-				scope.SetTag("column", c.Name)
-				sentry.CurrentHub().CaptureMessage(stack)
-			})
-		}
-	}()
-
-	if c.Resolver != nil {
-		if err := c.Resolver(ctx, client, resource, c); err != nil {
-			logger.Error().Err(err).Msg("column resolver finished with error")
-			atomic.AddUint64(&tableMetrics.Errors, 1)
-			if errors.As(err, &validationErr) {
-				sentry.WithScope(func(scope *sentry.Scope) {
-					scope.SetTag("table", resource.Table.Name)
-					scope.SetTag("column", c.Name)
-					sentry.CurrentHub().CaptureMessage(validationErr.MaskedError())
-				})
-			}
-		}
-	} else {
-		// base use case: try to get column with CamelCase name
-		v := funk.Get(resource.GetItem(), s.scheduler.caser.ToPascal(c.Name), funk.WithAllowZero())
-		if v != nil {
-			err := resource.Set(c.Name, v)
-			if err != nil {
-				logger.Error().Err(err).Msg("column resolver finished with error")
-				atomic.AddUint64(&tableMetrics.Errors, 1)
-				if errors.As(err, &validationErr) {
-					sentry.WithScope(func(scope *sentry.Scope) {
-						scope.SetTag("table", resource.Table.Name)
-						scope.SetTag("column", c.Name)
-						sentry.CurrentHub().CaptureMessage(validationErr.MaskedError())
-					})
-				}
-			}
-		}
 	}
 }
 
@@ -385,11 +300,23 @@ func maxDepth(tables schema.Tables) uint64 {
 	return depth
 }
 
-// unparam's suggestion to remove the second parameter is not good advice here.
-// nolint:unparam
-func max(a, b int) int {
-	if a > b {
-		return a
+func shardTableClients(tableClients []tableClient, shard *shard) []tableClient {
+	// For sharding to work as expected, tableClients must be deterministic between different shards.
+	if shard == nil || len(tableClients) == 0 {
+		return tableClients
 	}
-	return b
+	num := int(shard.num)
+	total := int(shard.total)
+	chunkSize := len(tableClients) / total
+	if chunkSize == 0 {
+		chunkSize = 1
+	}
+	chunks := lo.Chunk(tableClients, chunkSize)
+	if num > len(chunks) {
+		return nil
+	}
+	if len(chunks) > total && num == total {
+		return append(chunks[num-1], chunks[num]...)
+	}
+	return chunks[num-1]
 }

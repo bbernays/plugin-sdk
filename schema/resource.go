@@ -3,10 +3,11 @@ package schema
 import (
 	"crypto/sha256"
 	"fmt"
+	"hash"
+	"slices"
 
 	"github.com/cloudquery/plugin-sdk/v4/scalar"
 	"github.com/google/uuid"
-	"golang.org/x/exp/slices"
 )
 
 type Resources []*Resource
@@ -79,26 +80,39 @@ func (r *Resource) GetValues() scalar.Vector {
 
 //nolint:revive
 func (r *Resource) CalculateCQID(deterministicCQID bool) error {
+	// if `PrimaryKeyComponent` is set, we calculate the CQID based on those components
+	pkComponents := r.Table.PrimaryKeyComponents()
+	if len(pkComponents) > 0 {
+		return r.storeCQID(uuid.NewSHA1(uuid.UUID{}, calculateCqIDValue(r, pkComponents).Sum(nil)))
+	}
+
+	// If deterministicCQID is false, we generate a random CQID
 	if !deterministicCQID {
 		return r.storeCQID(uuid.New())
 	}
 	names := r.Table.PrimaryKeys()
+	// If there are no primary keys or if CQID is the only PK, we generate a random CQID
 	if len(names) == 0 || (len(names) == 1 && names[0] == CqIDColumn.Name) {
 		return r.storeCQID(uuid.New())
 	}
-	slices.Sort(names)
+
+	return r.storeCQID(uuid.NewSHA1(uuid.UUID{}, calculateCqIDValue(r, names).Sum(nil)))
+}
+
+func calculateCqIDValue(r *Resource, cols []string) hash.Hash {
 	h := sha256.New()
-	for _, name := range names {
+	slices.Sort(cols)
+	for _, col := range cols {
 		// We need to include the column name in the hash because the same value can be present in multiple columns and therefore lead to the same hash
-		h.Write([]byte(name))
-		h.Write([]byte(r.Get(name).String()))
+		h.Write([]byte(col))
+		h.Write([]byte(r.Get(col).String()))
 	}
-	return r.storeCQID(uuid.NewSHA1(uuid.UUID{}, h.Sum(nil)))
+	return h
 }
 
 func (r *Resource) storeCQID(value uuid.UUID) error {
-	// We skeep if _cq_id is not present.
-	// Mostly the problem here is because the transformaiton step is baked into the the resolving step
+	// We skip if _cq_id is not present.
+	// Mostly the problem here is because the transformation step is baked into the resolving step
 	if r.Table.Columns.Get(CqIDColumn.Name) == nil {
 		return nil
 	}
@@ -109,18 +123,47 @@ func (r *Resource) storeCQID(value uuid.UUID) error {
 	return r.Set(CqIDColumn.Name, b)
 }
 
+func (r *Resource) StoreCQClientID(clientID string) error {
+	// We skip if _cq_client_id is not present.
+	if r.Table.Columns.Get(CqClientIDColumn.Name) == nil {
+		return nil
+	}
+	return r.Set(CqClientIDColumn.Name, clientID)
+}
+
+type PKError struct {
+	MissingPKs []string
+}
+
+func (e *PKError) Error() string {
+	return fmt.Sprintf("missing primary key on columns: %v", e.MissingPKs)
+}
+
+type PKComponentError struct {
+	MissingPKComponents []string
+}
+
+func (e *PKComponentError) Error() string {
+	return fmt.Sprintf("missing primary key component on columns: %v", e.MissingPKComponents)
+}
+
 // Validates that all primary keys have values.
 func (r *Resource) Validate() error {
 	var missingPks []string
+	var missingPKComponents []string
 	for i, c := range r.Table.Columns {
-		if c.PrimaryKey {
-			if !r.data[i].IsValid() {
-				missingPks = append(missingPks, c.Name)
-			}
+		switch {
+		case c.PrimaryKey && !r.data[i].IsValid():
+			missingPks = append(missingPks, c.Name)
+		case c.PrimaryKeyComponent && !r.data[i].IsValid():
+			missingPKComponents = append(missingPKComponents, c.Name)
 		}
 	}
 	if len(missingPks) > 0 {
-		return fmt.Errorf("missing primary key on columns: %v", missingPks)
+		return &PKError{MissingPKs: missingPks}
+	}
+	if len(missingPKComponents) > 0 {
+		return &PKComponentError{MissingPKComponents: missingPKComponents}
 	}
 	return nil
 }

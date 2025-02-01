@@ -3,7 +3,7 @@ package scalar
 import (
 	"encoding/json"
 
-	"github.com/apache/arrow/go/v13/arrow"
+	"github.com/apache/arrow-go/v18/arrow"
 )
 
 type MonthInterval struct {
@@ -65,9 +65,10 @@ func (s *MonthInterval) Set(value any) error {
 		return nil
 	case *string:
 		if v == nil {
-			return s.Int.Set(nil)
+			s.Valid = false
+			return nil
 		}
-		return s.Set(value)
+		return s.Set(*v)
 	case map[string]any:
 		b, _ := json.Marshal(v)
 		return s.Set(b)

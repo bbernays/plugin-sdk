@@ -5,6 +5,48 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.98.0](https://github.com/cloudquery/plugin-sdk/compare/v4.97.0...v4.98.0) (2026-10-07)
+
+
+### Features
+
+* Add shared synthetic-record helpers for destination assessment ([#2619](https://github.com/cloudquery/plugin-sdk/issues/2619)) ([ce8099b](https://github.com/cloudquery/plugin-sdk/commit/ce8099bde118fe3aaf9a893cfe573f79e8818ee4))
+
+## [4.97.0](https://github.com/cloudquery/plugin-sdk/compare/v4.96.6...v4.97.0) (2026-10-07)
+
+
+### Features
+
+* Add destination assessment interface and AssessTables handler ([#2618](https://github.com/cloudquery/plugin-sdk/issues/2618)) ([de2f2e2](https://github.com/cloudquery/plugin-sdk/commit/de2f2e2500f546af11eeee80e6b5348d90a39b49))
+
+
+### Bug Fixes
+
+* **deps:** Update go module directive to v1.27.1 ([#2611](https://github.com/cloudquery/plugin-sdk/issues/2611)) ([f7f0a7b](https://github.com/cloudquery/plugin-sdk/commit/f7f0a7b50281a5decfe048b7b4ac24969bde7f26))
+* **deps:** Update golang.org/x/exp digest to 85c1c22 ([#2608](https://github.com/cloudquery/plugin-sdk/issues/2608)) ([ee83008](https://github.com/cloudquery/plugin-sdk/commit/ee8300836369c076a9decc80527dc28e9fa82be9))
+* **deps:** Update module github.com/cloudquery/plugin-pb-go to v1.27.24 ([#2621](https://github.com/cloudquery/plugin-sdk/issues/2621)) ([eab7d4c](https://github.com/cloudquery/plugin-sdk/commit/eab7d4ca94409d445df6b149d4b93fa5ea3112fc))
+* **deps:** Update module github.com/getsentry/sentry-go to v0.49.0 ([#2612](https://github.com/cloudquery/plugin-sdk/issues/2612)) ([4b99f85](https://github.com/cloudquery/plugin-sdk/commit/4b99f85afde59369aebc73f4e13bfde5af3c43d2))
+* **deps:** Update module golang.org/x/oauth2 to v0.37.0 ([#2613](https://github.com/cloudquery/plugin-sdk/issues/2613)) ([3e721c2](https://github.com/cloudquery/plugin-sdk/commit/3e721c2fbdda4fd195238b4394ddc39d2bfa3d15))
+* **deps:** Update opentelemetry-go monorepo ([#2616](https://github.com/cloudquery/plugin-sdk/issues/2616)) ([267d915](https://github.com/cloudquery/plugin-sdk/commit/267d9151fc2caf6c0933d3f22dafaaf74f401d18))
+
+## [4.96.6](https://github.com/cloudquery/plugin-sdk/compare/v4.96.5...v4.96.6) (2026-09-30)
+
+
+### Bug Fixes
+
+* **deps:** Update module github.com/cloudquery/plugin-pb-go to v1.27.23 ([#2605](https://github.com/cloudquery/plugin-sdk/issues/2605)) ([de5143b](https://github.com/cloudquery/plugin-sdk/commit/de5143b0a7eea25589785b39ac16dd699e1be71b))
+
+## [4.96.5](https://github.com/cloudquery/plugin-sdk/compare/v4.96.4...v4.96.5) (2026-09-30)
+
+
+### Bug Fixes
+
+* **deps:** Update aws-sdk-go-v2 monorepo ([#2600](https://github.com/cloudquery/plugin-sdk/issues/2600)) ([5a62e94](https://github.com/cloudquery/plugin-sdk/commit/5a62e948ad2ffa4a4610f9416bd22b1c562092cb))
+* **deps:** Update module github.com/apache/arrow-go/v18 to v18.8.0 ([#2602](https://github.com/cloudquery/plugin-sdk/issues/2602)) ([81490f5](https://github.com/cloudquery/plugin-sdk/commit/81490f5886fb149bed4e73d66b2fa8bf5b3d73b5))
+* **deps:** Update module github.com/cloudquery/cloudquery-api-go to v1.14.13 ([#2597](https://github.com/cloudquery/plugin-sdk/issues/2597)) ([ccaabe7](https://github.com/cloudquery/plugin-sdk/commit/ccaabe774236e5a8136b9cdaba08b3bcb673808c))
+* **deps:** Update module github.com/cloudquery/plugin-pb-go to v1.27.22 ([#2599](https://github.com/cloudquery/plugin-sdk/issues/2599)) ([5361d3f](https://github.com/cloudquery/plugin-sdk/commit/5361d3f08bf266f5b5beefb0f90aaa1fbf24484a))
+* **deps:** Update module google.golang.org/grpc to v1.84.0 ([#2601](https://github.com/cloudquery/plugin-sdk/issues/2601)) ([44d40ca](https://github.com/cloudquery/plugin-sdk/commit/44d40cad81e6bd853d5904cfbec4916645e66e08))
+
 ## [4.96.4](https://github.com/cloudquery/plugin-sdk/compare/v4.96.3...v4.96.4) (2026-09-22)
 
 
